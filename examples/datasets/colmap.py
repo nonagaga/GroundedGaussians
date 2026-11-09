@@ -492,8 +492,6 @@ class Dataset:
         """Decode and undistort the image of one item."""
         index = self.indices[item]
         image = imageio.imread(self.parser.image_paths[index])[..., :3]
-        image_name = self.parser.image_names[index]
-        cte = self.parser.cte.get(image_name, float("nan"))  # NaN = unlabeled
         camera_id = self.parser.camera_ids[index]
         params = self.parser.params_dict[camera_id]
         if len(params) > 0:
@@ -557,6 +555,7 @@ class Dataset:
             data["exposure"] = torch.tensor(exposure, dtype=torch.float32)
 
         # Always include the key so default collation works with partial labels
+        cte = self.parser.cte.get(self.parser.image_names[index], float("nan"))
         data["cte"] = torch.tensor(cte, dtype=torch.float32)
 
         if self.load_depths:
