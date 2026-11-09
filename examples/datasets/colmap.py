@@ -492,12 +492,8 @@ class Dataset:
         """Decode and undistort the image of one item."""
         index = self.indices[item]
         image = imageio.imread(self.parser.image_paths[index])[..., :3]
-        # add cte reading from image. You can get image filename from the path above, or maybe the image dict?
-        # Look up the CTE by COLMAP image name (e.g. "0001.jpg"). This key
-        # matches the CSV filename column, even when downscaled PNGs are used
-        # for the actual image paths.
         image_name = self.parser.image_names[index]
-        cte = self.parser.cte.get(image_name)
+        cte = self.parser.cte.get(image_name, float("nan"))  # NaN = unlabeled
         camera_id = self.parser.camera_ids[index]
         params = self.parser.params_dict[camera_id]
         if len(params) > 0:
@@ -560,9 +556,8 @@ class Dataset:
         if exposure is not None:
             data["exposure"] = torch.tensor(exposure, dtype=torch.float32)
 
-        # Add cross-track error (in pixels) if available for this image
-        if cte is not None:
-            data["cte"] = torch.tensor(cte, dtype=torch.float32)
+        # Always include the key so default collation works with partial labels
+        data["cte"] = torch.tensor(cte, dtype=torch.float32)
 
         if self.load_depths:
             # projected points to image plane to get depths
