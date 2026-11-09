@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import csv
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -102,7 +103,8 @@ def _camera_distortion(camera: Any) -> tuple[np.ndarray, str]:
         return np.array(params[4:8], dtype=np.float32), "perspective"
     if model_name == "OPENCV_FISHEYE":
         return np.array(params[4:8], dtype=np.float32), "fisheye"
-
+    if model_name == "SIMPLE_RADIAL_FISHEYE":
+        return np.array(params[0:4], dtype=np.float32), "fisheye"
     raise ValueError(
         f"Only perspective and fisheye cameras are supported, got {model_name}"
     )
@@ -134,6 +136,27 @@ class Parser:
         self.normalize = normalize
         self.test_every = test_every
         self.load_exposure = load_exposure
+
+        # CSV is saved in data_dir with filename vision_cte.csv
+        # CSV is formatted as follows:
+        # filename,vision_cte_px
+        # 0001.jpg,-9.91
+
+        # dict where cte[image_name] -> float
+        self.cte: Dict[str, float] = {}
+        cte_file = os.path.join(data_dir, "vision_cte.csv")
+        if os.path.exists(cte_file):
+            with open(cte_file, newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    name = row["filename"].strip()
+                    value = row["vision_cte_px"].strip()
+                    if value == "":
+                        continue
+                    self.cte[name] = float(value)
+            print(f"[Parser] Loaded CTE for {len(self.cte)} images.")
+        else:
+            print(f"[Parser] No CTE file found at {cte_file}.")
 
         colmap_dir = os.path.join(data_dir, "sparse/0/")
         if not os.path.exists(colmap_dir):
@@ -469,6 +492,12 @@ class Dataset:
         """Decode and undistort the image of one item."""
         index = self.indices[item]
         image = imageio.imread(self.parser.image_paths[index])[..., :3]
+        # add cte reading from image. You can get image filename from the path above, or maybe the image dict?
+        # Look up the CTE by COLMAP image name (e.g. "0001.jpg"). This key
+        # matches the CSV filename column, even when downscaled PNGs are used
+        # for the actual image paths.
+        image_name = self.parser.image_names[index]
+        cte = self.parser.cte.get(image_name)
         camera_id = self.parser.camera_ids[index]
         params = self.parser.params_dict[camera_id]
         if len(params) > 0:
@@ -530,6 +559,10 @@ class Dataset:
         exposure = self.parser.exposure_values[index]
         if exposure is not None:
             data["exposure"] = torch.tensor(exposure, dtype=torch.float32)
+
+        # Add cross-track error (in pixels) if available for this image
+        if cte is not None:
+            data["cte"] = torch.tensor(cte, dtype=torch.float32)
 
         if self.load_depths:
             # projected points to image plane to get depths

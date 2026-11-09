@@ -74,6 +74,7 @@ from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
+from cte_loss import cte_loss, hard_cte
 
 @dataclass
 class Config:
@@ -161,7 +162,7 @@ class Config:
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
     init_extent: float = 3.0
     # Degree of spherical harmonics
-    sh_degree: int = 3
+    sh_degree: int = 1
     # Cast SH coefficients to fp16 before feeding the SH kernel.
     # Parameters and Adam state stay fp32.
     sh_fp16: bool = False
@@ -184,7 +185,7 @@ class Config:
         default_factory=DefaultStrategy
     )
     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
-    packed: bool = False
+    packed: bool = True
     # Use sparse gradients for optimization. (experimental)
     sparse_grad: bool = False
     # Use visible adam from Taming 3DGS. (experimental)
@@ -263,6 +264,24 @@ class Config:
     # 3DGUT (uncented transform + eval 3D)
     with_ut: bool = False
     with_eval3d: bool = False
+
+    # Enable CTE loss (requires colmap dataset with vision_cte.csv)
+    cte_loss: bool = True
+    # Weight for CTE loss
+    cte_lambda: float = 0.1
+    # Step at which CTE loss kicks in (geometry should be roughly converged)
+    cte_start_step: int = 5_000
+    # Bottom fraction of the frame used for track detection
+    cte_band_frac: float = 0.25
+    # OpenCV-scale HSV bounds for the orange track (H 0-180, S/V 0-255)
+    cte_hsv_lower: Tuple[int, int, int] = (5, 120, 120)
+    cte_hsv_upper: Tuple[int, int, int] = (25, 255, 255)
+    # Min fraction of band pixels that must be track-colored
+    cte_min_frac: float = 0.002
+    # Softness of the HSV thresholds (H, S, V)
+    cte_tau: Tuple[float, float, float] = (2.0, 10.0, 10.0)
+    # Width (px) at which labels were measured; None = same as rendered width
+    cte_label_width: Optional[float] = None
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -373,7 +392,7 @@ def create_splats_with_optimizers(
         name: optimizer_class(
             [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
             eps=1e-15 / math.sqrt(BS),
-            # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
+            # IGNORE THIS TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
             betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
             fused=True,
         )
@@ -968,7 +987,23 @@ class Runner:
             ssimloss = ssim_loss(
                 colors_ssim.permute(0, 3, 1, 2), pixels_ssim.permute(0, 3, 1, 2)
             )
+
             loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
+
+            if cfg.cte_loss and step >= cfg.cte_start_step:
+                            cte_labels = data["cte"].to(device)  # [B], NaN = unlabeled
+                            cteloss = cte_loss(
+                                torch.clamp(colors, 0.0, 1.0),
+                                cte_labels,
+                                band_frac=cfg.cte_band_frac,
+                                hsv_lower=cfg.cte_hsv_lower,
+                                hsv_upper=cfg.cte_hsv_upper,
+                                min_frac=cfg.cte_min_frac,
+                                tau=cfg.cte_tau,
+                                label_width=cfg.cte_label_width,
+                            )
+                            loss = loss + cfg.cte_lambda * cteloss
+
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(
@@ -1032,6 +1067,8 @@ class Runner:
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
+                if cfg.cte_loss and step >= cfg.cte_start_step:
+                    self.writer.add_scalar("train/cteloss", cteloss.item(), step)
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
                 if cfg.post_processing is not None:
@@ -1267,6 +1304,17 @@ class Runner:
                 metrics["psnr"].append(self.psnr(colors_p, pixels_p))
                 metrics["ssim"].append(self.ssim(colors_p, pixels_p))
                 metrics["lpips"].append(self.lpips(colors_p, pixels_p))
+
+                if cfg.cte_loss and not torch.isnan(data["cte"]).any():
+                    W = colors.shape[2]
+                    pred = hard_cte(
+                        colors[0], cfg.cte_band_frac,
+                        cfg.cte_hsv_lower, cfg.cte_hsv_upper, cfg.cte_min_frac,
+                    )
+                    label = data["cte"].item()
+                    err = float(W) if pred is None else min(abs(pred - label), W)
+                    metrics["cte_err_px"].append(torch.tensor(err))
+
                 # Compute color-corrected metrics for fair comparison across methods
                 if cfg.use_color_correction_metric:
                     if cfg.color_correct_method == "affine":
