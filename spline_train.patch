@@ -1,0 +1,2182 @@
+diff --git a/examples/constraints.txt b/examples/constraints.txt
+new file mode 100644
+index 00000000..b87b1ca7
+--- /dev/null
++++ b/examples/constraints.txt
+@@ -0,0 +1,3 @@
++# constraints.txt
++torch==2.14.0+cu130
++torchvision==0.29.0+cu130
+\ No newline at end of file
+diff --git a/examples/cte_loss.py b/examples/cte_loss.py
+new file mode 100644
+index 00000000..da7bd927
+--- /dev/null
++++ b/examples/cte_loss.py
+@@ -0,0 +1,132 @@
++import cv2
++import numpy as np
++import torch
++import torch.nn.functional as F
++
++
++# ---------------------------------------------------------------------------
++# Original hard (non-differentiable) detector -- use for eval / label checks.
++# ---------------------------------------------------------------------------
++def detect_track_centroid(frame, band_frac, hsv_lower, hsv_upper, min_frac=0.002):
++    """
++    Find the x centroid of orange pixels in the bottom `band_frac` of the frame.
++    Returns x (float, full-frame pixel coords) or None if no track is found.
++    `frame` is a BGR uint8 image.
++    """
++    h, _ = frame.shape[:2]
++    band_h = max(1, int(round(h * band_frac)))
++    band = frame[h - band_h :]
++
++    hsv = cv2.cvtColor(band, cv2.COLOR_BGR2HSV)
++    mask = cv2.inRange(hsv, np.array(hsv_lower), np.array(hsv_upper))
++    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
++
++    m = cv2.moments(mask, binaryImage=True)
++    if m["m00"] < min_frac * mask.size:
++        return None
++    return m["m10"] / m["m00"]
++
++
++def hard_cte(image, band_frac, hsv_lower, hsv_upper, min_frac=0.002):
++    """image: [H, W, 3] RGB float tensor in [0, 1]. Returns CTE px, or None on failure."""
++    rgb = (image.detach().clamp(0, 1).cpu().numpy() * 255).round().astype(np.uint8)
++    bgr = np.ascontiguousarray(rgb[..., ::-1])
++    x = detect_track_centroid(bgr, band_frac, hsv_lower, hsv_upper, min_frac)
++    return None if x is None else x - image.shape[1] / 2.0
++
++
++# ---------------------------------------------------------------------------
++# Differentiable torch port -- use for the training loss.
++# ---------------------------------------------------------------------------
++def rgb_to_hsv_cv(rgb: torch.Tensor) -> torch.Tensor:
++    """[..., 3] RGB in [0,1] -> HSV in OpenCV uint8 scale (H 0-180, S/V 0-255)."""
++    r, g, b = rgb.unbind(-1)
++    v, _ = rgb.max(-1)
++    mn, _ = rgb.min(-1)
++    c = v - mn
++    c_safe = c.clamp_min(1e-6)
++    s = c / v.clamp_min(1e-6)
++
++    h = torch.where(
++        v == r,
++        ((g - b) / c_safe) % 6.0,
++        torch.where(v == g, (b - r) / c_safe + 2.0, (r - g) / c_safe + 4.0),
++    )
++    h = torch.where(c > 1e-6, h * 30.0, torch.zeros_like(h))  # 60 deg / 2 = 30
++    return torch.stack([h, s * 255.0, v * 255.0], dim=-1)
++
++
++def soft_track_centroid(
++    images, band_frac, hsv_lower, hsv_upper, min_frac=0.002, tau=(2.0, 10.0, 10.0)
++):
++    """
++    images: [B, H, W, 3] RGB in [0, 1].
++    Returns (centroid_x [B], found [B] bool, mass [B], min_mass float).
++    """
++    B, H, W, _ = images.shape
++    band_h = max(1, int(round(H * band_frac)))
++    band = images[:, H - band_h :].clamp(0, 1)
++
++    hsv = rgb_to_hsv_cv(band)
++    lo = torch.tensor(hsv_lower, dtype=hsv.dtype, device=hsv.device)
++    hi = torch.tensor(hsv_upper, dtype=hsv.dtype, device=hsv.device)
++    t = torch.tensor(tau, dtype=hsv.dtype, device=hsv.device)
++
++    # Soft cv2.inRange: product of per-channel soft step functions.
++    m = (torch.sigmoid((hsv - lo) / t) * torch.sigmoid((hi - hsv) / t)).prod(-1)
++    m = m[:, None]  # [B, 1, h, W]
++
++    # Soft MORPH_OPEN with a 3x3 kernel: erode then dilate.
++    m = -F.max_pool2d(-m, 3, 1, 1)
++    m = F.max_pool2d(m, 3, 1, 1)
++
++    mass = m.sum(dim=(1, 2, 3))
++    min_mass = min_frac * band_h * W
++    col = m.sum(dim=(1, 2))  # [B, W]
++    xs = torch.arange(W, device=m.device, dtype=m.dtype)
++    centroid = (col * xs).sum(-1) / mass.clamp_min(1e-6)
++    return centroid, mass >= min_mass, mass, min_mass
++
++
++def cte_loss(
++    images,
++    cte_labels,
++    band_frac,
++    hsv_lower,
++    hsv_upper,
++    min_frac=0.002,
++    tau=(2.0, 10.0, 10.0),
++    label_width=None,
++    hinge_weight=1.0,
++):
++    """
++    L1 between detected CTE and labeled CTE, normalized by image width so that
++    the worst case (detection failure) is exactly 1.0.
++
++    images:     [B, H, W, 3] RGB render in [0, 1]
++    cte_labels: [B] pixels (NaN = unlabeled, skipped)
++    label_width: width (px) the labels were measured at; labels are rescaled
++                 to the render width if it differs.
++    """
++    B, H, W, _ = images.shape
++    cte_labels = cte_labels.to(images.dtype)
++    if label_width is not None:
++        cte_labels = cte_labels * (W / label_width)
++
++    cx, found, mass, min_mass = soft_track_centroid(
++        images, band_frac, hsv_lower, hsv_upper, min_frac, tau
++    )
++    pred = cx - W / 2.0
++    err = (pred - cte_labels).abs().clamp(max=W)
++    # Detection failed -> max CTE error (= image width).
++    err = torch.where(found, err, torch.full_like(err, float(W)))
++    loss = err / W
++
++    # A failed detection has a constant error and therefore no gradient.
++    # This hinge pushes the splats to produce more track-colored pixels.
++    loss = loss + hinge_weight * F.relu(1.0 - mass / min_mass) * (~found).float()
++
++    valid = ~torch.isnan(cte_labels)
++    if not valid.any():
++        return images.sum() * 0.0
++    return loss[valid].mean()
+\ No newline at end of file
+diff --git a/examples/datasets/colmap.py b/examples/datasets/colmap.py
+index 5e7e0890..e371d0d3 100644
+--- a/examples/datasets/colmap.py
++++ b/examples/datasets/colmap.py
+@@ -14,6 +14,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import csv
+ import json
+ import os
+ from concurrent.futures import ThreadPoolExecutor
+@@ -102,7 +103,8 @@ def _camera_distortion(camera: Any) -> tuple[np.ndarray, str]:
+         return np.array(params[4:8], dtype=np.float32), "perspective"
+     if model_name == "OPENCV_FISHEYE":
+         return np.array(params[4:8], dtype=np.float32), "fisheye"
+-
++    if model_name == "SIMPLE_RADIAL_FISHEYE":
++        return np.array(params[0:4], dtype=np.float32), "fisheye"
+     raise ValueError(
+         f"Only perspective and fisheye cameras are supported, got {model_name}"
+     )
+@@ -135,6 +137,27 @@ class Parser:
+         self.test_every = test_every
+         self.load_exposure = load_exposure
+ 
++        # CSV is saved in data_dir with filename vision_cte.csv
++        # CSV is formatted as follows:
++        # filename,vision_cte_px
++        # 0001.jpg,-9.91
++
++        # dict where cte[image_name] -> float
++        self.cte: Dict[str, float] = {}
++        cte_file = os.path.join(data_dir, "vision_cte.csv")
++        if os.path.exists(cte_file):
++            with open(cte_file, newline="") as f:
++                reader = csv.DictReader(f)
++                for row in reader:
++                    name = row["filename"].strip()
++                    value = row["vision_cte_px"].strip()
++                    if value == "":
++                        continue
++                    self.cte[name] = float(value)
++            print(f"[Parser] Loaded CTE for {len(self.cte)} images.")
++        else:
++            print(f"[Parser] No CTE file found at {cte_file}.")
++
+         colmap_dir = os.path.join(data_dir, "sparse/0/")
+         if not os.path.exists(colmap_dir):
+             colmap_dir = os.path.join(data_dir, "sparse")
+@@ -531,6 +554,10 @@ class Dataset:
+         if exposure is not None:
+             data["exposure"] = torch.tensor(exposure, dtype=torch.float32)
+ 
++        # Always include the key so default collation works with partial labels
++        cte = self.parser.cte.get(self.parser.image_names[index], float("nan"))
++        data["cte"] = torch.tensor(cte, dtype=torch.float32)
++
+         if self.load_depths:
+             # projected points to image plane to get depths
+             worldtocams = np.linalg.inv(camtoworlds)
+diff --git a/examples/requirements.txt b/examples/requirements.txt
+index 880ee10c..7c7b0815 100644
+--- a/examples/requirements.txt
++++ b/examples/requirements.txt
+@@ -1,15 +1,16 @@
+ # torch, torchvision MUST be pre-installed (internal builds matching each other).
+ # Pin torch here so pip cannot silently downgrade it when resolving transitive
+ # dependencies (e.g. torchvision from PyPI would pull a public torch build).
+-torch==2.9.1
+-nvidia-ncore>=19.0.0
++# --extra-index-url https://download.pytorch.org/whl/cu130
++# torch==2.14.0+cu130
++# nvidia-ncore>=19.0.0
+ 
+ # Official COLMAP Python bindings for data parsing
+ pycolmap>=3.10.0
+ # (optional) nerfacc for torch version rasterization
+ # git+https://github.com/nerfstudio-project/nerfacc
+ 
+-torchvision==0.24.1
++# torchvision==0.24.1
+ viser
+ git+https://github.com/nerfstudio-project/nerfview@4538024fe0d15fd1a0e4d760f3695fc44ca72787
+ imageio[ffmpeg]
+diff --git a/examples/simple_trainer.py b/examples/simple_trainer.py
+index 46fb2ffb..61f924ec 100644
+--- a/examples/simple_trainer.py
++++ b/examples/simple_trainer.py
+@@ -17,12 +17,19 @@
+ import json
+ import math
+ import os
++import sys
+ import time
+ from collections import defaultdict
++import dataclasses
+ from dataclasses import dataclass, field
+ from pathlib import Path
+ from typing import Dict, List, Optional, Tuple, Union
+ 
++# Ensure examples dir is in sys.path (do not add repo root or gsplat root to avoid shadowing pre-compiled gsplat)
++_EXAMPLES_DIR = Path(__file__).resolve().parent
++if str(_EXAMPLES_DIR) not in sys.path:
++    sys.path.insert(0, str(_EXAMPLES_DIR))
++
+ import imageio
+ import numpy as np
+ import torch
+@@ -55,6 +62,20 @@ from typing_extensions import Literal, assert_never
+ from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
+ 
+ from gsplat import export_splats
++
++# --------------------------------------------------------------------------- #
++# Spline Fit Library Integration
++# --------------------------------------------------------------------------- #
++try:
++    import spline_fit
++    from spline_fit import (
++        fit_n_cubic_splines_torch,
++        fit_three_cubic_bsplines_torch,
++        exact_integrated_l2_error_torch,
++        extract_centerline_points,
++    )
++except ImportError:
++    spline_fit = None
+ from gsplat.compression import PngCompression
+ from gsplat.distributed import cli
+ from gsplat.optimizers import SelectiveAdam
+@@ -74,6 +95,382 @@ from gsplat.strategy import DefaultStrategy, MCMCStrategy
+ from gsplat_viewer import GsplatViewer, GsplatRenderTabState
+ from nerfview import CameraState, RenderTabState, apply_float_colormap
+ 
++# --------------------------------------------------------------------------- #
++# Differentiable Spline Fitting & Exact Integrated L2 Loss
++# --------------------------------------------------------------------------- #
++BERNSTEIN_GRAM_4x4 = torch.tensor(
++    [
++        [20.0, 10.0, 4.0, 1.0],
++        [10.0, 12.0, 9.0, 4.0],
++        [4.0, 9.0, 12.0, 10.0],
++        [1.0, 4.0, 10.0, 20.0],
++    ],
++    dtype=torch.float32,
++) / 140.0
++
++
++def rgb_to_hsv_torch(rgb: torch.Tensor) -> torch.Tensor:
++    """[..., 3] RGB in [0, 1] -> HSV in OpenCV uint8 scale (H 0-180, S/V 0-255)."""
++    r, g, b = rgb.unbind(-1)
++    v, _ = rgb.max(-1)
++    mn, _ = rgb.min(-1)
++    c = v - mn
++    c_safe = c.clamp_min(1e-6)
++    s = c / v.clamp_min(1e-6)
++
++    h = torch.where(
++        v == r,
++        ((g - b) / c_safe) % 6.0,
++        torch.where(v == g, (b - r) / c_safe + 2.0, (r - g) / c_safe + 4.0),
++    )
++    h = torch.where(c > 1e-6, h * 30.0, torch.zeros_like(h))
++    return torch.stack([h, s * 255.0, v * 255.0], dim=-1)
++
++
++def soft_orange_mask_torch(
++    images: torch.Tensor,
++    hsv_lower=(0, 27, 182),
++    hsv_upper=(13, 255, 255),
++    tau=(1.5, 3.5, 3.5),
++) -> torch.Tensor:
++    """
++    images: [B, H, W, 3] RGB float tensor in [0, 1].
++    Returns soft probability mask: [B, H, W] in [0, 1].
++    """
++    hsv = rgb_to_hsv_torch(images)
++    lo = torch.tensor(hsv_lower, dtype=hsv.dtype, device=hsv.device)
++    hi = torch.tensor(hsv_upper, dtype=hsv.dtype, device=hsv.device)
++    t = torch.tensor(tau, dtype=hsv.dtype, device=hsv.device)
++
++    m = (torch.sigmoid((hsv - lo) / t) * torch.sigmoid((hi - hsv) / t)).prod(dim=-1)
++    m = m.unsqueeze(1)  # [B, 1, H, W]
++
++    # Soft morphology open: erode (min_pool) followed by dilate (max_pool)
++    m = -F.max_pool2d(-m, kernel_size=3, stride=1, padding=1)
++    m = F.max_pool2d(m, kernel_size=3, stride=1, padding=1)
++    return m.squeeze(1)  # [B, H, W]
++
++
++def extract_centerline_points_torch(
++    mask: torch.Tensor,
++    band_frac: float = 0.8,
++    num_rows: int = 36,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """
++    Extract centerline points starting from the bottom of the image towards the top.
++    mask: [H, W] soft orange mask in [0, 1].
++    band_frac: height fraction measured from the bottom of the image.
++    num_rows: number of sample rows to extract.
++
++    Returns:
++        pts: [num_rows, 2] in normalized coordinates [0, 1] x [0, 1]
++        row_mass: [num_rows] sum of weights across each row
++    """
++    H, W = mask.shape
++    band_h = max(num_rows, int(round(H * band_frac)))
++
++    # y_indices starting from bottom (H - 1) up to H - band_h
++    y_indices = torch.linspace(H - 1, H - band_h, steps=num_rows, device=mask.device).round().long()
++    y_indices = y_indices.clamp(0, H - 1)
++
++    row_slices = mask[y_indices, :]  # [num_rows, W]
++    row_mass = row_slices.sum(dim=-1)  # [num_rows]
++
++    # Expected x coordinate (soft-argmax):
++    x_coords = torch.arange(W, dtype=mask.dtype, device=mask.device)
++    expected_x = (row_slices * x_coords).sum(dim=-1) / row_mass.clamp_min(1e-6)
++
++    # Normalized coordinates [0, 1] x [0, 1]
++    norm_x = expected_x / float(max(1, W - 1))
++    norm_y = y_indices.to(mask.dtype) / float(max(1, H - 1))
++
++    pts = torch.stack([norm_x, norm_y], dim=-1)  # [num_rows, 2]
++    return pts, row_mass
++
++
++def compute_chord_parameters_torch(points: torch.Tensor) -> torch.Tensor:
++    """Compute normalized chord-length parameter u in [0, 1] for points: [N, 2]."""
++    diffs = points[1:] - points[:-1]
++    chord_lengths = torch.norm(diffs, dim=-1)
++    cum = torch.cat([torch.zeros(1, dtype=points.dtype, device=points.device), torch.cumsum(chord_lengths, dim=0)])
++    total_length = cum[-1]
++    safe_total = torch.where(total_length > 1e-7, total_length, torch.ones_like(total_length))
++    u = cum / safe_total
++    return torch.clamp(u, 0.0, 1.0)
++
++
++def cubic_bezier_basis_torch(u: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Cubic Bernstein basis functions for u in [0, 1]."""
++    u_c = torch.clamp(u, 0.0, 1.0)
++    one_minus_u = 1.0 - u_c
++    b0 = one_minus_u ** 3
++    b1 = 3.0 * (one_minus_u ** 2) * u_c
++    b2 = 3.0 * one_minus_u * (u_c ** 2)
++    b3 = u_c ** 3
++    return b0, b1, b2, b3
++
++
++def fit_cubic_bspline_segment_torch(
++    seg_pts: torch.Tensor,
++    fixed_p0: torch.Tensor | None = None,
++    reg_lambda: float = 1e-6,
++) -> torch.Tensor:
++    """
++    Fit a cubic B-spline segment to seg_pts [N, 2] via differentiable least squares.
++    Returns ctrl_pts: [4, 2]
++    """
++    p0 = fixed_p0 if fixed_p0 is not None else seg_pts[0]
++    p3 = seg_pts[-1]
++
++    u = compute_chord_parameters_torch(seg_pts)
++    b0, b1, b2, b3 = cubic_bezier_basis_torch(u)
++
++    A = torch.stack([b1, b2], dim=1)  # [N, 2]
++    target = seg_pts - (b0.unsqueeze(1) * p0.unsqueeze(0) + b3.unsqueeze(1) * p3.unsqueeze(0))
++
++    AtA = A.t() @ A  # [2, 2]
++    eye = torch.eye(2, dtype=A.dtype, device=A.device) * reg_lambda
++    AtY = A.t() @ target  # [2, 2]
++    sol = torch.linalg.solve(AtA + eye, AtY)  # [2, 2]
++    p1 = sol[0]
++    p2 = sol[1]
++
++    ctrl_pts = torch.stack([p0, p1, p2, p3], dim=0)  # [4, 2]
++    return ctrl_pts
++
++
++def fit_three_cubic_bsplines_torch(pts: torch.Tensor) -> torch.Tensor:
++    """
++    Fit 3 sequential cubic B-splines with C1 tangent continuity to pts: [N, 2].
++    Returns control_points: [3, 4, 2]
++    """
++    if "fit_n_cubic_splines_torch" in globals():
++        return fit_n_cubic_splines_torch(pts, num_segments=3, continuity="C1")
++
++    N = pts.shape[0]
++    k1 = N // 3
++    k2 = (2 * N) // 3
++    slices = [
++        (0, k1),
++        (k1, k2),
++        (k2, N),
++    ]
++
++    all_ctrl = []
++    prev_end: torch.Tensor | None = None
++    for i, (start_idx, end_idx) in enumerate(slices):
++        seg_end = end_idx + (1 if i < 2 and end_idx < N else 0)
++        seg_pts = pts[start_idx:seg_end]
++        ctrl = fit_cubic_bspline_segment_torch(seg_pts, fixed_p0=prev_end)
++        prev_end = ctrl[3]
++        all_ctrl.append(ctrl)
++
++    return torch.stack(all_ctrl, dim=0)  # [3, 4, 2]
++
++
++def exact_integrated_l2_error(
++    ctrl_render: torch.Tensor,
++    ctrl_target: torch.Tensor,
++    img_w: float | None = None,
++    img_h: float | None = None,
++) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
++    """
++    Exact integrated L2 error between two cubic B-spline curves using the Gram matrix.
++    ctrl_render: [num_segments, 4, 2]
++    ctrl_target: [num_segments, 4, 2]
++    If img_w and img_h are provided, returns (err_norm, err_px).
++    """
++    M = BERNSTEIN_GRAM_4x4.to(dtype=ctrl_render.dtype, device=ctrl_render.device)
++    diff = ctrl_render - ctrl_target
++
++    seg_errors = []
++    seg_errors_px = []
++    for s in range(diff.shape[0]):
++        dx = diff[s, :, 0]  # [4]
++        dy = diff[s, :, 1]  # [4]
++        err2_x = dx @ M @ dx
++        err2_y = dy @ M @ dy
++        err2_norm = err2_x + err2_y
++        seg_errors.append(torch.sqrt(err2_norm.clamp_min(1e-8)))
++        if img_w is not None and img_h is not None:
++            err2_px = (img_w**2) * err2_x + (img_h**2) * err2_y
++            seg_errors_px.append(torch.sqrt(err2_px.clamp_min(1e-8)))
++
++    err_norm = torch.stack(seg_errors).mean()
++    if img_w is not None and img_h is not None:
++        err_px = torch.stack(seg_errors_px).mean()
++        return err_norm, err_px
++    return err_norm
++
++
++def spline_loss(
++    render: Optional[torch.Tensor] = None,
++    target: Optional[torch.Tensor] = None,
++    band_frac: float = 0.70,
++    hsv_lower=(0, 27, 182),
++    hsv_upper=(13, 255, 255),
++    min_frac: float = 0.0004,
++    tau=(1.5, 3.5, 3.5),
++    mask_render: Optional[torch.Tensor] = None,
++    mask_target: Optional[torch.Tensor] = None,
++    num_segments: int = 4,
++    continuity: str = "C1",
++    centerline_algorithm: str = "scan",
++) -> torch.Tensor:
++    """
++    Fit N cubic B-splines with C1 tangent continuity to both rendered splat image and ground-truth image,
++    computing exact integrated L2 curve error.
++    Masks out / skips frames where the curve isn't well defined on either render or target.
++
++    render: [B, H, W, 3] in [0, 1] (optional if mask_render is provided)
++    target: [B, H, W, 3] in [0, 1] (optional if mask_target is provided)
++    num_segments: Number of C1 cubic spline segments to fit (default: 4)
++    centerline_algorithm: 'scan' (fast row scanner) or 'skeleton' (geodesic graph BFS)
++    """
++    if mask_render is None:
++        assert render is not None, "Either render or mask_render must be provided"
++        mask_render = soft_orange_mask_torch(render, hsv_lower, hsv_upper, tau)
++    if mask_target is None:
++        assert target is not None, "Either target or mask_target must be provided"
++        mask_target = soft_orange_mask_torch(target.detach(), hsv_lower, hsv_upper, tau)
++
++    B, H, W = mask_render.shape
++
++    losses = []
++    min_mass = min_frac * H * W * band_frac
++
++    for b in range(B):
++        m_r = mask_render[b]
++        m_t = mask_target[b]
++
++        mass_r = m_r.sum()
++        mass_t = m_t.sum()
++
++        # Masking: if either target or render does not have a well-defined track, skip
++        if mass_t < min_mass or mass_r < min_mass:
++            continue
++
++        if centerline_algorithm == "skeleton" and spline_fit is not None and hasattr(spline_fit, "extract_centerline_points"):
++            m_t_np = (m_t.clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)
++            pts_t_np = spline_fit.extract_centerline_points(m_t_np, band_frac=band_frac, method="skeleton")
++            if pts_t_np is not None and len(pts_t_np) >= 4:
++                pts_t = torch.from_numpy(pts_t_np).to(dtype=m_t.dtype, device=m_t.device)
++            else:
++                pts_t, _ = extract_centerline_points_torch(m_t, band_frac=band_frac)
++        else:
++            pts_t, _ = extract_centerline_points_torch(m_t, band_frac=band_frac)
++
++        if "fit_n_cubic_splines_torch" in globals():
++            ctrl_t = fit_n_cubic_splines_torch(pts_t, num_segments=num_segments, continuity=continuity).detach()
++        else:
++            ctrl_t = fit_three_cubic_bsplines_torch(pts_t).detach()
++
++        if centerline_algorithm == "skeleton" and spline_fit is not None and hasattr(spline_fit, "extract_centerline_points"):
++            if pts_t is not None and len(pts_t) >= 4:
++                y_levels = (pts_t[:, 1] * float(H - 1)).round().long().clamp(0, H - 1)
++                row_slices = m_r[y_levels, :]
++                row_mass = row_slices.sum(dim=-1)
++                x_coords = torch.arange(W, dtype=m_r.dtype, device=m_r.device)
++                expected_x = (row_slices * x_coords).sum(dim=-1) / row_mass.clamp_min(1e-6)
++                norm_x = expected_x / float(max(1, W - 1))
++                norm_y = y_levels.to(m_r.dtype) / float(max(1, H - 1))
++                pts_r = torch.stack([norm_x, norm_y], dim=-1)
++            else:
++                pts_r, _ = extract_centerline_points_torch(m_r, band_frac=band_frac)
++        else:
++            pts_r, _ = extract_centerline_points_torch(m_r, band_frac=band_frac)
++
++        if "fit_n_cubic_splines_torch" in globals():
++            ctrl_r = fit_n_cubic_splines_torch(pts_r, num_segments=num_segments, continuity=continuity)
++        else:
++            ctrl_r = fit_three_cubic_bsplines_torch(pts_r)
++
++        l2_err = exact_integrated_l2_error(ctrl_r, ctrl_t)
++        losses.append(l2_err)
++
++    if not losses:
++        return mask_render.sum() * 0.0
++    return torch.stack(losses).mean()
++
++
++def track_dice_loss(
++    render: Optional[torch.Tensor] = None,
++    target: Optional[torch.Tensor] = None,
++    band_frac: float = 0.8,
++    hsv_lower=(0, 110, 100),
++    hsv_upper=(19, 255, 255),
++    tau=(2.5, 10.0, 10.0),
++    smooth: float = 1.0,
++    mask_render: Optional[torch.Tensor] = None,
++    mask_target: Optional[torch.Tensor] = None,
++) -> torch.Tensor:
++    """
++    Differentiable Soft Dice loss on orange track masks:
++        L_dice = 1.0 - (2 * sum(M_r * M_t) + smooth) / (sum(M_r) + sum(M_t) + smooth)
++
++    Operates on either [B, H, W, 3] images or precomputed [B, H, W] soft masks in [0, 1].
++    Restricts evaluation to the bottom `band_frac` region of each image.
++    """
++    if mask_render is None:
++        assert render is not None, "Either render or mask_render must be provided"
++        mask_render = soft_orange_mask_torch(render, hsv_lower, hsv_upper, tau)
++    if mask_target is None:
++        assert target is not None, "Either target or mask_target must be provided"
++        mask_target = soft_orange_mask_torch(target.detach(), hsv_lower, hsv_upper, tau)
++
++    if band_frac < 1.0:
++        H = mask_render.shape[1]
++        band_h = max(1, int(round(H * band_frac)))
++        mask_render = mask_render[:, -band_h:, :]
++        mask_target = mask_target[:, -band_h:, :]
++
++    intersection = (mask_render * mask_target).sum(dim=(-2, -1))
++    cardinality = mask_render.sum(dim=(-2, -1)) + mask_target.sum(dim=(-2, -1))
++    dice = (2.0 * intersection + smooth) / (cardinality + smooth)
++    return (1.0 - dice).mean()
++
++
++def eval_spline_error(
++    render: torch.Tensor,
++    target: torch.Tensor,
++    band_frac: float = 0.70,
++    hsv_lower=(0, 27, 182),
++    hsv_upper=(13, 255, 255),
++    min_frac: float = 0.0004,
++    num_segments: int = 4,
++    continuity: str = "C1",
++    centerline_algorithm: str = "scan",
++) -> tuple[torch.Tensor, torch.Tensor] | tuple[None, None]:
++    """Non-training evaluation: returns (err_norm, err_px) or (None, None) if track missing."""
++    with torch.no_grad():
++        m_r = soft_orange_mask_torch(render.unsqueeze(0), hsv_lower, hsv_upper)[0]
++        m_t = soft_orange_mask_torch(target.unsqueeze(0), hsv_lower, hsv_upper)[0]
++        H, W = m_r.shape
++        min_mass = min_frac * H * W * band_frac
++        if m_t.sum() < min_mass or m_r.sum() < min_mass:
++            return None, None
++
++        if spline_fit is not None and hasattr(spline_fit, "extract_centerline_points"):
++            m_r_np = (m_r.clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)
++            m_t_np = (m_t.clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)
++            pts_r_np = spline_fit.extract_centerline_points(m_r_np, band_frac=band_frac, method=centerline_algorithm)
++            pts_t_np = spline_fit.extract_centerline_points(m_t_np, band_frac=band_frac, method=centerline_algorithm)
++            if pts_r_np is None or pts_t_np is None or len(pts_r_np) < 4 or len(pts_t_np) < 4:
++                return None, None
++            pts_r = torch.from_numpy(pts_r_np).to(dtype=render.dtype, device=render.device)
++            pts_t = torch.from_numpy(pts_t_np).to(dtype=render.dtype, device=render.device)
++        else:
++            pts_r, _ = extract_centerline_points_torch(m_r, band_frac)
++            pts_t, _ = extract_centerline_points_torch(m_t, band_frac)
++
++        if "fit_n_cubic_splines_torch" in globals():
++            ctrl_r = fit_n_cubic_splines_torch(pts_r, num_segments=num_segments, continuity=continuity)
++            ctrl_t = fit_n_cubic_splines_torch(pts_t, num_segments=num_segments, continuity=continuity)
++        else:
++            ctrl_r = fit_three_cubic_bsplines_torch(pts_r)
++            ctrl_t = fit_three_cubic_bsplines_torch(pts_t)
++        return exact_integrated_l2_error(ctrl_r, ctrl_t, img_w=float(W), img_h=float(H))
++
+ 
+ @dataclass
+ class Config:
+@@ -161,7 +558,7 @@ class Config:
+     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
+     init_extent: float = 3.0
+     # Degree of spherical harmonics
+-    sh_degree: int = 3
++    sh_degree: int = 1
+     # Cast SH coefficients to fp16 before feeding the SH kernel.
+     # Parameters and Adam state stay fp32.
+     sh_fp16: bool = False
+@@ -184,7 +581,7 @@ class Config:
+         default_factory=DefaultStrategy
+     )
+     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
+-    packed: bool = False
++    packed: bool = True
+     # Use sparse gradients for optimization. (experimental)
+     sparse_grad: bool = False
+     # Use visible adam from Taming 3DGS. (experimental)
+@@ -264,6 +661,41 @@ class Config:
+     with_ut: bool = False
+     with_eval3d: bool = False
+ 
++    # Enable Soft Dice loss on track mask
++    dice_loss: bool = True
++    # Compute and output track Dice metric during evaluation upon completion
++    eval_dice_err: bool = True
++    # Weight for Soft Dice loss
++    dice_lambda: float = 0.02
++    # Step at which Dice loss kicks in (can start at 0 or early steps)
++    dice_start_step: int = 0
++    # Smoothing term for Dice calculation
++    dice_smooth: float = 1.0
++
++    # Enable Spline loss for training (fits cubic B-splines to GT and rendered track)
++    spline_loss: bool = False
++    # Number of C1 tangent-continuous cubic spline segments to fit
++    spline_segments: int = 4
++    # Centerline extraction algorithm for spline fitting: 'scan' (fast row scanner) or 'skeleton' (geodesic graph BFS)
++    spline_centerline_algorithm: Literal["scan", "skeleton"] = "scan"
++    # Compute and output spline L2 error metric during evaluation upon completion
++    eval_spline_err: bool = True
++    # Weight for Spline loss
++    spline_lambda: float = 0.02
++    # Step at which Spline loss kicks in (geometry should be roughly converged)
++    spline_start_step: int = 5_000
++    # Height fraction of the frame from the bottom used for track spline fitting and dice mask
++    spline_band_frac: float = 0.70
++    # OpenCV-scale HSV bounds for the orange track (H 0-180, S/V 0-255)
++    spline_hsv_lower: Tuple[int, int, int] = (0, 27, 182)
++    spline_hsv_upper: Tuple[int, int, int] = (13, 255, 255)
++    # Min fraction of pixels that must be track-colored
++    spline_min_frac: float = 0.0004
++    # Softness of the HSV thresholds (H, S, V)
++    spline_tau: Tuple[float, float, float] = (1.5, 3.5, 3.5)
++    # Downsample factor for auxiliary track losses (dice / spline) during training (0.5 = 2x downsample)
++    spline_downsample_factor: float = 0.5
++
+     def adjust_steps(self, factor: float):
+         self.eval_steps = [int(i * factor) for i in self.eval_steps]
+         self.save_steps = [int(i * factor) for i in self.save_steps]
+@@ -373,7 +805,7 @@ def create_splats_with_optimizers(
+         name: optimizer_class(
+             [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
+             eps=1e-15 / math.sqrt(BS),
+-            # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
++            # IGNORE THIS TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
+             betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+             fused=True,
+         )
+@@ -481,6 +913,19 @@ class Runner:
+ 
+         # Model
+         feature_dim = 32 if cfg.app_opt else None
++        if cfg.sparse_grad:
++            if world_size > 1:
++                if world_rank == 0:
++                    print(
++                        f"[Trainer] Note: sparse_grad is not supported with distributed multi-GPU training "
++                        f"(world_size={world_size}). Disabling sparse_grad and using packed rasterization."
++                    )
++                cfg.sparse_grad = False
++            elif not cfg.packed:
++                if world_rank == 0:
++                    print("[Trainer] Note: sparse_grad requires packed=True. Enabling packed mode.")
++                cfg.packed = True
++
+         self.splats, self.optimizers = create_splats_with_optimizers(
+             self.parser,
+             init_type=cfg.init_type,
+@@ -968,7 +1413,64 @@ class Runner:
+             ssimloss = ssim_loss(
+                 colors_ssim.permute(0, 3, 1, 2), pixels_ssim.permute(0, 3, 1, 2)
+             )
++
+             loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
++
++            run_dice = cfg.dice_loss and step >= cfg.dice_start_step
++            run_spline = cfg.spline_loss and step >= cfg.spline_start_step
++
++            if run_dice or run_spline:
++                if cfg.spline_downsample_factor < 1.0:
++                    c_track = F.interpolate(
++                        colors.permute(0, 3, 1, 2),
++                        scale_factor=cfg.spline_downsample_factor,
++                        mode="bilinear",
++                        align_corners=False,
++                    ).permute(0, 2, 3, 1)
++                    p_track = F.interpolate(
++                        pixels.permute(0, 3, 1, 2),
++                        scale_factor=cfg.spline_downsample_factor,
++                        mode="bilinear",
++                        align_corners=False,
++                    ).permute(0, 2, 3, 1)
++                else:
++                    c_track = colors
++                    p_track = pixels
++
++                c_clamped = torch.clamp(c_track, 0.0, 1.0)
++                mask_r = soft_orange_mask_torch(
++                    c_clamped,
++                    cfg.spline_hsv_lower,
++                    cfg.spline_hsv_upper,
++                    cfg.spline_tau,
++                )
++                mask_t = soft_orange_mask_torch(
++                    p_track.detach(),
++                    cfg.spline_hsv_lower,
++                    cfg.spline_hsv_upper,
++                    cfg.spline_tau,
++                )
++
++                if run_dice:
++                    diceloss = track_dice_loss(
++                        mask_render=mask_r,
++                        mask_target=mask_t,
++                        band_frac=cfg.spline_band_frac,
++                        smooth=cfg.dice_smooth,
++                    )
++                    loss = loss + cfg.dice_lambda * diceloss
++
++                if run_spline:
++                    splineloss = spline_loss(
++                        mask_render=mask_r,
++                        mask_target=mask_t,
++                        band_frac=cfg.spline_band_frac,
++                        min_frac=cfg.spline_min_frac,
++                        num_segments=cfg.spline_segments,
++                        centerline_algorithm=cfg.spline_centerline_algorithm,
++                    )
++                    loss = loss + cfg.spline_lambda * splineloss
++
+             if cfg.depth_loss:
+                 # query depths from depth map
+                 points = torch.stack(
+@@ -1008,6 +1510,10 @@ class Runner:
+             loss.backward()
+ 
+             desc = f"loss={loss.item():.3f}| sh degree={sh_degree_to_use}| "
++            if run_dice:
++                desc += f"dice={diceloss.item():.4f}| "
++            if run_spline:
++                desc += f"spline={splineloss.item():.4f}| "
+             if cfg.depth_loss:
+                 desc += f"depth loss={depthloss.item():.6f}| "
+             if cfg.pose_opt and cfg.pose_noise:
+@@ -1032,6 +1538,18 @@ class Runner:
+                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
+                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
+                 self.writer.add_scalar("train/mem", mem, step)
++                if run_dice:
++                    self.writer.add_scalar("train/diceloss", diceloss.item(), step)
++                    self.writer.add_scalar(
++                        "train/track_dice", (1.0 - diceloss).item(), step
++                    )
++                if run_spline:
++                    self.writer.add_scalar("train/splineloss", splineloss.item(), step)
++                    self.writer.add_scalar(
++                        "train/splineloss_px",
++                        splineloss.item() * max(colors.shape[1], colors.shape[2]),
++                        step,
++                    )
+                 if cfg.depth_loss:
+                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
+                 if cfg.post_processing is not None:
+@@ -1267,6 +1785,34 @@ class Runner:
+                 metrics["psnr"].append(self.psnr(colors_p, pixels_p))
+                 metrics["ssim"].append(self.ssim(colors_p, pixels_p))
+                 metrics["lpips"].append(self.lpips(colors_p, pixels_p))
++
++                if cfg.dice_loss or cfg.eval_dice_err:
++                    dice_val = 1.0 - track_dice_loss(
++                        render=colors,
++                        target=pixels,
++                        band_frac=cfg.spline_band_frac,
++                        hsv_lower=cfg.spline_hsv_lower,
++                        hsv_upper=cfg.spline_hsv_upper,
++                        tau=cfg.spline_tau,
++                        smooth=1.0,
++                    ).item()
++                    metrics["track_dice"].append(torch.tensor(dice_val))
++
++                if cfg.spline_loss or cfg.eval_spline_err:
++                    spline_err_norm, spline_err_px = eval_spline_error(
++                        render=colors[0],
++                        target=pixels[0],
++                        band_frac=cfg.spline_band_frac,
++                        hsv_lower=cfg.spline_hsv_lower,
++                        hsv_upper=cfg.spline_hsv_upper,
++                        min_frac=cfg.spline_min_frac,
++                        num_segments=cfg.spline_segments,
++                        centerline_algorithm=cfg.spline_centerline_algorithm,
++                    )
++                    if spline_err_norm is not None:
++                        metrics["spline_l2_err"].append(spline_err_norm.cpu())
++                        metrics["spline_l2_err_px"].append(spline_err_px.cpu())
++
+                 # Compute color-corrected metrics for fair comparison across methods
+                 if cfg.use_color_correction_metric:
+                     if cfg.color_correct_method == "affine":
+@@ -1288,18 +1834,30 @@ class Runner:
+                     "num_GS": len(self.splats["means"]),
+                 }
+             )
++            dice_str = (
++                f", Track Dice: {stats['track_dice']:.4f}"
++                if "track_dice" in stats
++                else ""
++            )
++            spline_str = (
++                f", Spline L2 Err: {stats['spline_l2_err']:.6f} ({stats['spline_l2_err_px']:.2f} px)"
++                if "spline_l2_err" in stats
++                else ""
++            )
+             if cfg.use_color_correction_metric:
+                 print(
+                     f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
+                     f"CC_PSNR: {stats['cc_psnr']:.3f}, CC_SSIM: {stats['cc_ssim']:.4f}, CC_LPIPS: {stats['cc_lpips']:.3f} "
+                     f"Time: {stats['ellipse_time']:.3f}s/image "
+                     f"Number of GS: {stats['num_GS']}"
++                    f"{dice_str}{spline_str}"
+                 )
+             else:
+                 print(
+                     f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
+                     f"Time: {stats['ellipse_time']:.3f}s/image "
+                     f"Number of GS: {stats['num_GS']}"
++                    f"{dice_str}{spline_str}"
+                 )
+             # save stats as json
+             with open(f"{self.stats_dir}/{stage}_step{step:04d}.json", "w") as f:
+@@ -1510,7 +2068,65 @@ class Runner:
+         return renders
+ 
+ 
++def print_overridden_config(cfg: Config, base_cfg: Config):
++    """Print any options that were overridden from their default values via CLI."""
++    def _differs(v1, v2):
++        if v1 is v2:
++            return False
++        try:
++            res = (v1 != v2)
++            if isinstance(res, (bool, np.bool_)):
++                return res
++            if hasattr(res, "any"):
++                return bool(res.any())
++            return bool(res)
++        except Exception:
++            return repr(v1) != repr(v2)
++
++    overrides = []
++    for f in dataclasses.fields(Config):
++        if f.name == "strategy":
++            continue
++        val = getattr(cfg, f.name)
++        dval = getattr(base_cfg, f.name)
++        if _differs(val, dval):
++            overrides.append((f.name, dval, val))
++
++    if hasattr(cfg, "strategy") and hasattr(base_cfg, "strategy"):
++        strat = cfg.strategy
++        bstrat = base_cfg.strategy
++        if type(strat) is type(bstrat) and dataclasses.is_dataclass(strat):
++            for sf in dataclasses.fields(strat):
++                val = getattr(strat, sf.name)
++                dval = getattr(bstrat, sf.name)
++                if _differs(val, dval):
++                    overrides.append((f"strategy.{sf.name}", dval, val))
++
++    print("\n" + "=" * 78)
++    if overrides:
++        print(f"[Trainer] Overridden CLI Options ({len(overrides)} applied):")
++        for name, dval, val in overrides:
++            print(f"  • {name:<28}: {dval} -> {val}")
++    else:
++        print("[Trainer] No CLI options were overridden (running with defaults).")
++    print("=" * 78 + "\n")
++
++
+ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
++    if world_rank == 0:
++        base_cfg = (
++            Config(
++                init_opa=0.5,
++                init_scale=0.1,
++                opacity_reg=0.01,
++                scale_reg=0.01,
++                strategy=MCMCStrategy(verbose=True),
++            )
++            if isinstance(cfg.strategy, MCMCStrategy)
++            else Config(strategy=DefaultStrategy(verbose=True))
++        )
++        print_overridden_config(cfg, base_cfg)
++
+     # Import post-processing modules based on configuration
+     # These imports must be here (not in __main__) for distributed workers
+     if cfg.post_processing == "bilateral_grid":
+diff --git a/examples/spline_fit.py b/examples/spline_fit.py
+new file mode 100644
+index 00000000..4b6cc935
+--- /dev/null
++++ b/examples/spline_fit.py
+@@ -0,0 +1,1198 @@
++#!/usr/bin/env python3
++"""
++spline_fit.py - Generalized N-Segment Tangent-Continuous (C1) Cubic Spline Fitting & Centerline Extraction.
++
++Provides modular, high-performance spline fitting, evaluation, and track segmentation
++utilities for use across analysis scripts (compare_models.py, splines.py) and PyTorch
++training pipelines (simple_trainer.py).
++
++Key Capabilities:
++  1. Generalized N-Segment Cubic Splines:
++     - Global linear least-squares fitting of arbitrary N segments (N >= 1).
++     - Strict C0 (position) and C1 (tangent vector) continuity at all junctions.
++     - Optional endpoint pinning (start/end points) or unconstrained fitting.
++  2. Exact Continuous L2 Error Metric:
++     - Integrated analytical L2 difference between two N-segment splines using the
++       Bernstein Gram matrix (closed-form, no sampling approximation).
++  3. Robust Centerline Extraction:
++     - Pre-filtered morphological closing + connected components to eliminate isolated noise.
++     - Spatial continuity tracking (max_jump_px) to ignore split clusters/reflections.
++     - Vertical gap termination (max_gap_rows) to prevent snapping into the horizon.
++     - Dual backends: 'scan' (fast robust row scanner) and 'skeleton' (geodesic graph BFS).
++  4. PyTorch Differentiable Backend:
++     - Differentiable analogue using torch.linalg.lstsq when PyTorch is available.
++
++Usage as module:
++  from spline_fit import (
++      fit_n_cubic_splines,
++      extract_centerline_points,
++      extract_orange_pixels,
++      compute_exact_integrated_l2,
++      draw_spline_curve,
++  )
++
++  ctrl_pts = fit_n_cubic_splines(norm_pts, num_segments=4, continuity="C1")
++"""
++
++from __future__ import annotations
++
++import argparse
++import os
++import sys
++from collections import deque
++from pathlib import Path
++
++import cv2
++import numpy as np
++
++# Optional PyTorch import for differentiable training pipelines
++try:
++    import torch
++    TORCH_AVAILABLE = True
++except ImportError:
++    TORCH_AVAILABLE = False
++
++
++# --------------------------------------------------------------------------- #
++# Bernstein Basis & Gram Matrix Constants
++# --------------------------------------------------------------------------- #
++# Exact analytical Gram matrix for cubic Bernstein polynomials on [0, 1]:
++# M_ij = integral_0^1 B_i(u) * B_j(u) du
++BERNSTEIN_GRAM_4x4 = np.array(
++    [
++        [20.0, 10.0, 4.0, 1.0],
++        [10.0, 12.0, 9.0, 4.0],
++        [4.0, 9.0, 12.0, 10.0],
++        [1.0, 4.0, 10.0, 20.0],
++    ],
++    dtype=np.float64,
++) / 140.0
++
++
++def cubic_bezier_basis(u: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
++    """
++    Compute the 4 cubic Bernstein basis functions B_0(u), B_1(u), B_2(u), B_3(u) for u in [0, 1].
++    """
++    u_c = np.clip(u, 0.0, 1.0)
++    one_minus_u = 1.0 - u_c
++    b0 = one_minus_u ** 3
++    b1 = 3.0 * (one_minus_u ** 2) * u_c
++    b2 = 3.0 * one_minus_u * (u_c ** 2)
++    b3 = u_c ** 3
++    return b0, b1, b2, b3
++
++
++def compute_chord_parameters(points: np.ndarray) -> np.ndarray:
++    """
++    Compute normalized cumulative chord-length parameter u in [0, 1] for a sequence of 2D points.
++    """
++    if len(points) <= 1:
++        return np.zeros(len(points), dtype=np.float64)
++    diffs = np.diff(points, axis=0)
++    chords = np.concatenate(([0.0], np.cumsum(np.hypot(diffs[:, 0], diffs[:, 1]))))
++    total_len = chords[-1]
++    if total_len <= 1e-9 or np.isnan(total_len):
++        return np.linspace(0.0, 1.0, len(points), dtype=np.float64)
++    return chords / total_len
++
++
++def resample_path(pts: np.ndarray, num_samples: int = 48) -> np.ndarray:
++    """Resample path coordinates uniformly along arc/chord length."""
++    if len(pts) <= 1:
++        return pts
++    u_orig = compute_chord_parameters(pts)
++    u_new = np.linspace(0.0, 1.0, num_samples)
++    x_new = np.interp(u_new, u_orig, pts[:, 0])
++    y_new = np.interp(u_new, u_orig, pts[:, 1])
++    return np.column_stack([x_new, y_new])
++
++
++# --------------------------------------------------------------------------- #
++# Generalized N-Segment Tangent-Continuous (C1) Cubic Spline Fitting
++# --------------------------------------------------------------------------- #
++def fit_n_cubic_splines(
++    points: np.ndarray,
++    num_segments: int = 3,
++    continuity: str = "C1",
++    pin_endpoints: bool = True,
++) -> np.ndarray:
++    """
++    Fit N sequential cubic Bezier curves to 2D points with exact continuity constraints.
++
++    Args:
++        points: Array of shape [N, 2] in normalized coordinates [0, 1] x [0, 1].
++        num_segments: Number of cubic segments N >= 1 (e.g. 1, 2, 3, 4, 5).
++        continuity:
++          - 'C1': Position (C0) AND tangent vector (C1) continuous across all junctions.
++                  Ensures matching first derivatives: P_{s, 1} = 2 * J_s - P_{s-1, 2}.
++          - 'C0': Position continuous only (shared junction points J_s = P_{s-1, 3} = P_{s, 0}).
++        pin_endpoints: If True, locks P_{0,0} = points[0] and P_{N-1,3} = points[-1].
++
++    Returns:
++        ctrl_pts: Array of shape [num_segments, 4, 2] containing control points for each segment.
++    """
++    n_pts = len(points)
++    if num_segments < 1:
++        raise ValueError("num_segments must be >= 1")
++
++    # Handle short or degenerate point sets
++    if n_pts < 2:
++        pt = points[0] if n_pts == 1 else np.array([0.5, 0.5], dtype=np.float64)
++        return np.tile(pt, (num_segments, 4, 1))
++
++    if n_pts < 4:
++        p0 = points[0]
++        p3 = points[-1]
++        t_vals = np.linspace(0.0, 1.0, num_segments + 1)
++        juncs = [p0 + (p3 - p0) * t for t in t_vals]
++        out = []
++        for s in range(num_segments):
++            s0 = juncs[s]
++            s3 = juncs[s + 1]
++            s1 = s0 + (s3 - s0) * (1.0 / 3.0)
++            s2 = s0 + (s3 - s0) * (2.0 / 3.0)
++            out.append([s0, s1, s2, s3])
++        return np.array(out, dtype=np.float64)
++
++    # Chord-length parameterization
++    u_global = compute_chord_parameters(points)
++    seg_breaks = np.linspace(0.0, 1.0, num_segments + 1)
++
++    # Assign points to segments based on parameter range
++    seg_indices = np.clip(np.floor(u_global * num_segments).astype(int), 0, num_segments - 1)
++    u_local = (u_global - seg_breaks[seg_indices]) / (seg_breaks[seg_indices + 1] - seg_breaks[seg_indices])
++    u_local = np.clip(u_local, 0.0, 1.0)
++
++    b0, b1, b2, b3 = cubic_bezier_basis(u_local)
++
++    # ----------------------------------------------------------------------- #
++    # Parameterization of Global Linear Least Squares System
++    # ----------------------------------------------------------------------- #
++    p_start = points[0] if pin_endpoints else None
++    p_end = points[-1] if pin_endpoints else None
++
++    if continuity.upper() == "C1":
++        # C1 Tangent Continuity:
++        # Segment 0: P_{0,0}, P_{0,1}, P_{0,2}, J_1
++        # Segment s: P_{s,0} = J_s, P_{s,1} = 2*J_s - P_{s-1,2}, P_{s,2}, J_{s+1}
++        # Last segment: P_{n-1,3}
++        #
++        # Free variables indexing:
++        # If pin_endpoints:
++        #   idx 0: P_{0,1}
++        #   idx 1: P_{0,2}
++        #   idx 2: J_1 (if n > 1)
++        #   For s in 1..num_segments-1:
++        #     idx 2*s: J_s
++        #     idx 2*s - 1: P_{s-1, 2}
++        #     idx 2*s + 1: P_{s, 2}
++        n_vars = 2 * num_segments if pin_endpoints else 2 * num_segments + 2
++
++        coeff = np.zeros((num_segments, 4, n_vars), dtype=np.float64)
++        const = np.zeros((num_segments, 4, 2), dtype=np.float64)
++
++        if pin_endpoints:
++            const[0, 0] = p_start
++            coeff[0, 1, 0] = 1.0  # P_{0,1}
++            coeff[0, 2, 1] = 1.0  # P_{0,2}
++
++            if num_segments == 1:
++                const[0, 3] = p_end
++            else:
++                coeff[0, 3, 2] = 1.0  # J_1
++
++            for s in range(1, num_segments):
++                idx_Js = 2 * s
++                idx_prev_p2 = 2 * s - 1
++                idx_ps2 = 2 * s + 1
++
++                # P_{s,0} = J_s
++                coeff[s, 0, idx_Js] = 1.0
++                # P_{s,1} = 2*J_s - P_{s-1,2}  (exact C1 tangent derivative continuity)
++                coeff[s, 1, idx_Js] += 2.0
++                coeff[s, 1, idx_prev_p2] -= 1.0
++                # P_{s,2} is free
++                coeff[s, 2, idx_ps2] = 1.0
++
++                # P_{s,3}
++                if s == num_segments - 1:
++                    const[s, 3] = p_end
++                else:
++                    idx_next_J = 2 * (s + 1)
++                    coeff[s, 3, idx_next_J] = 1.0
++        else:
++            # Unconstrained endpoints: P_{0,0} and P_{n-1,3} are also free variables
++            coeff[0, 0, 0] = 1.0
++            coeff[0, 1, 1] = 1.0
++            coeff[0, 2, 2] = 1.0
++            if num_segments == 1:
++                coeff[0, 3, 3] = 1.0
++            else:
++                coeff[0, 3, 3] = 1.0
++                for s in range(1, num_segments):
++                    idx_Js = 2 * s + 1
++                    idx_prev_p2 = 2 * s
++                    idx_ps2 = 2 * s + 2
++                    coeff[s, 0, idx_Js] = 1.0
++                    coeff[s, 1, idx_Js] += 2.0
++                    coeff[s, 1, idx_prev_p2] -= 1.0
++                    coeff[s, 2, idx_ps2] = 1.0
++                    if s == num_segments - 1:
++                        coeff[s, 3, 2 * s + 3] = 1.0
++                    else:
++                        coeff[s, 3, 2 * (s + 1) + 1] = 1.0
++
++    else:
++        # C0 Continuity Only:
++        # Each segment has independent P_{s,1} and P_{s,2}, sharing only J_s = P_{s-1,3} = P_{s,0}
++        n_vars = 3 * num_segments - 1 if pin_endpoints else 3 * num_segments + 1
++        coeff = np.zeros((num_segments, 4, n_vars), dtype=np.float64)
++        const = np.zeros((num_segments, 4, 2), dtype=np.float64)
++
++        var_idx = 0
++        if pin_endpoints:
++            const[0, 0] = p_start
++        else:
++            coeff[0, 0, var_idx] = 1.0
++            var_idx += 1
++
++        for s in range(num_segments):
++            if s > 0:
++                # P_{s,0} = J_s = P_{s-1,3}
++                coeff[s, 0] = coeff[s - 1, 3]
++
++            coeff[s, 1, var_idx] = 1.0
++            var_idx += 1
++            coeff[s, 2, var_idx] = 1.0
++            var_idx += 1
++
++            if s == num_segments - 1 and pin_endpoints:
++                const[s, 3] = p_end
++            else:
++                coeff[s, 3, var_idx] = 1.0
++                var_idx += 1
++
++    # Build linear system A @ X = B
++    A = np.zeros((n_pts, n_vars), dtype=np.float64)
++    B = points.copy().astype(np.float64)
++
++    for i in range(n_pts):
++        s = seg_indices[i]
++        c_i = b0[i] * coeff[s, 0] + b1[i] * coeff[s, 1] + b2[i] * coeff[s, 2] + b3[i] * coeff[s, 3]
++        A[i] = c_i
++        const_i = b0[i] * const[s, 0] + b1[i] * const[s, 1] + b2[i] * const[s, 2] + b3[i] * const[s, 3]
++        B[i] -= const_i
++
++    # Linear least-squares solve
++    X, _, _, _ = np.linalg.lstsq(A, B, rcond=None)
++
++    # Reconstruct all control points [num_segments, 4, 2]
++    ctrl_pts = np.zeros((num_segments, 4, 2), dtype=np.float64)
++    for s in range(num_segments):
++        for k in range(4):
++            ctrl_pts[s, k] = coeff[s, k] @ X + const[s, k]
++
++    return ctrl_pts
++
++
++def fit_three_cubic_bsplines_numpy(norm_pts: np.ndarray) -> np.ndarray:
++    """
++    Backward-compatible convenience wrapper: fits 3 C1 tangent-continuous cubic splines.
++    Returns: [3, 4, 2] control points.
++    """
++    return fit_n_cubic_splines(norm_pts, num_segments=3, continuity="C1", pin_endpoints=True)
++
++
++# --------------------------------------------------------------------------- #
++# Exact Integrated Continuous L2 Error Metric
++# --------------------------------------------------------------------------- #
++def compute_exact_integrated_l2(
++    ctrl_a: np.ndarray,
++    ctrl_b: np.ndarray,
++    img_w: float | None = None,
++    img_h: float | None = None,
++) -> tuple[float, float]:
++    """
++    Calculate exact integrated continuous L2 error between two N-segment cubic Bezier splines
++    using the closed-form Bernstein Gram matrix.
++
++    Integral over [0, 1]:
++      E^2 = sum_{s=0}^{N-1} integral_0^1 || C_s^A(u) - C_s^B(u) ||^2 du
++          = sum_{s=0}^{N-1} (dx_s^T @ M @ dx_s + dy_s^T @ M @ dy_s)
++
++    Args:
++        ctrl_a: [N, 4, 2] control points of curve A.
++        ctrl_b: [N, 4, 2] control points of curve B.
++        img_w: Width scale in pixels (optional, converts normalized error to pixel error).
++        img_h: Height scale in pixels (optional).
++
++    Returns:
++        err_norm: Mean integrated L2 error in normalized [0, 1] image coordinates.
++        err_px: Mean integrated L2 error scaled to original image pixel dimensions.
++    """
++    if ctrl_a.shape != ctrl_b.shape:
++        raise ValueError(f"Control point shapes must match: {ctrl_a.shape} vs {ctrl_b.shape}")
++
++    diff = ctrl_a - ctrl_b
++    num_segments = diff.shape[0]
++    M = BERNSTEIN_GRAM_4x4
++
++    w = img_w or 1.0
++    h = img_h or 1.0
++
++    errs_norm = []
++    errs_px = []
++
++    for s in range(num_segments):
++        dx = diff[s, :, 0]
++        dy = diff[s, :, 1]
++        e2_x = float(dx @ M @ dx)
++        e2_y = float(dy @ M @ dy)
++
++        e2_norm = max(0.0, e2_x + e2_y)
++        errs_norm.append(np.sqrt(e2_norm))
++
++        e2_px = max(0.0, (w ** 2) * e2_x + (h ** 2) * e2_y)
++        errs_px.append(np.sqrt(e2_px))
++
++    return float(np.mean(errs_norm)), float(np.mean(errs_px))
++
++
++def evaluate_spline_curve(ctrl_pts: np.ndarray, samples_per_segment: int = 40) -> np.ndarray:
++    """
++    Evaluate an N-segment cubic spline [N, 4, 2] at uniform parameter steps.
++    Returns: [N * samples_per_segment, 2] curve points.
++    """
++    num_segments = ctrl_pts.shape[0]
++    u = np.linspace(0.0, 1.0, samples_per_segment)
++    b0, b1, b2, b3 = cubic_bezier_basis(u)
++
++    curve_pts = []
++    for s in range(num_segments):
++        seg = ctrl_pts[s]
++        xs = b0 * seg[0, 0] + b1 * seg[1, 0] + b2 * seg[2, 0] + b3 * seg[3, 0]
++        ys = b0 * seg[0, 1] + b1 * seg[1, 1] + b2 * seg[2, 1] + b3 * seg[3, 1]
++        pts = np.column_stack([xs, ys])
++        curve_pts.append(pts)
++
++    return np.vstack(curve_pts)
++
++
++def draw_spline_curve(
++    bgr_img: np.ndarray,
++    ctrl_pts: np.ndarray,
++    color: tuple[int, int, int] = (0, 255, 0),
++    thickness: int = 2,
++    draw_dots: bool = False,
++    draw_tangents: bool = False,
++) -> None:
++    """
++    Render smooth N-segment cubic spline curves directly onto an image canvas.
++    """
++    h, w = bgr_img.shape[:2]
++    num_segments = ctrl_pts.shape[0]
++    u = np.linspace(0.0, 1.0, 40)
++    b0, b1, b2, b3 = cubic_bezier_basis(u)
++
++    for s in range(num_segments):
++        seg = ctrl_pts[s]
++        xs = (b0 * seg[0, 0] + b1 * seg[1, 0] + b2 * seg[2, 0] + b3 * seg[3, 0]) * w
++        ys = (b0 * seg[0, 1] + b1 * seg[1, 1] + b2 * seg[2, 1] + b3 * seg[3, 1]) * h
++        poly_pts = np.column_stack([xs, ys]).astype(np.int32)
++        cv2.polylines(bgr_img, [poly_pts], isClosed=False, color=color, thickness=thickness, lineType=cv2.LINE_AA)
++
++        if draw_tangents:
++            # Draw tangent handles between P0-P1 and P2-P3
++            p0 = (int(round(seg[0, 0] * w)), int(round(seg[0, 1] * h)))
++            p1 = (int(round(seg[1, 0] * w)), int(round(seg[1, 1] * h)))
++            p2 = (int(round(seg[2, 0] * w)), int(round(seg[2, 1] * h)))
++            p3 = (int(round(seg[3, 0] * w)), int(round(seg[3, 1] * h)))
++            cv2.line(bgr_img, p0, p1, (180, 180, 180), 1, cv2.LINE_AA)
++            cv2.line(bgr_img, p2, p3, (180, 180, 180), 1, cv2.LINE_AA)
++
++        if draw_dots:
++            for pt in seg:
++                px = int(round(pt[0] * w))
++                py = int(round(pt[1] * h))
++                cv2.circle(bgr_img, (px, py), 3, color, -1, lineType=cv2.LINE_AA)
++
++
++# --------------------------------------------------------------------------- #
++# Robust Centerline Extraction & Track Segmentation
++# --------------------------------------------------------------------------- #
++def extract_orange_pixels(
++    bgr_img: np.ndarray,
++    hsv_lower: tuple[int, int, int] = (0, 53, 145),
++    hsv_upper: tuple[int, int, int] = (7, 255, 255),
++    morph_open: bool = True,
++    bg_dim: float = 0.0,
++) -> tuple[np.ndarray, np.ndarray, int]:
++    """
++    Apply OpenCV 8-bit HSV thresholding to isolate orange track pixels.
++    Returns:
++        masked_img: BGR image showing only orange pixels (dimmed or black background).
++        mask: uint8 binary mask (0 or 255).
++        pixel_count: total number of orange pixels detected.
++    """
++    hsv = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2HSV)
++    lower = np.array(hsv_lower, dtype=np.uint8)
++    upper = np.array(hsv_upper, dtype=np.uint8)
++    mask = cv2.inRange(hsv, lower, upper)
++
++    if morph_open:
++        kernel = np.ones((3, 3), np.uint8)
++        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
++
++    if bg_dim > 0.0:
++        dimmed = (bgr_img.astype(np.float32) * bg_dim).astype(np.uint8)
++        masked_img = np.where(mask[:, :, None] > 0, bgr_img, dimmed)
++    else:
++        masked_img = cv2.bitwise_and(bgr_img, bgr_img, mask=mask)
++
++    pixel_count = int(np.count_nonzero(mask))
++    return masked_img, mask, pixel_count
++
++
++def compute_orange_pixel_error(
++    img_pred: np.ndarray,
++    img_base: np.ndarray,
++    hsv_lower: tuple[int, int, int] = (1, 53, 145),
++    hsv_upper: tuple[int, int, int] = (7, 255, 255),
++    morph_open: bool = True,
++) -> dict[str, float]:
++    """Calculate MAE, IoU, and Dice score between predicted and base orange masks."""
++    _, mask_pred, count_pred = extract_orange_pixels(img_pred, hsv_lower, hsv_upper, morph_open=morph_open)
++    _, mask_base, count_base = extract_orange_pixels(img_base, hsv_lower, hsv_upper, morph_open=morph_open)
++
++    intersection = np.logical_and(mask_pred > 0, mask_base > 0)
++    union = np.logical_or(mask_pred > 0, mask_base > 0)
++    inter_cnt = float(np.count_nonzero(intersection))
++    union_cnt = float(np.count_nonzero(union))
++
++    iou = inter_cnt / union_cnt if union_cnt > 0 else 1.0
++    dice = (2.0 * inter_cnt) / (count_pred + count_base) if (count_pred + count_base) > 0 else 1.0
++
++    if inter_cnt > 0:
++        pred_pts = img_pred[intersection].astype(np.float32)
++        base_pts = img_base[intersection].astype(np.float32)
++        mae = float(np.mean(np.abs(pred_pts - base_pts)))
++    else:
++        mae = float(np.mean(np.abs(img_pred.astype(np.float32) - img_base.astype(np.float32))))
++
++    return {
++        "mae": mae,
++        "iou": float(iou),
++        "dice": float(dice),
++        "count_pred": count_pred,
++        "count_base": count_base,
++    }
++
++
++def extract_skeleton_centerline(
++    mask: np.ndarray,
++    band_frac: float = 0.8,
++    min_mass: int = 30,
++    scale: float = 0.25,
++    num_samples: int = 48,
++) -> np.ndarray | None:
++    """
++    Extract continuous track centerline using morphological skeletonization and geodesic BFS graph traversal.
++    Handles hairpin turns and multi-lane intersections cleanly.
++    """
++    h, w = mask.shape[:2]
++    cutoff_y = int(round(h * (1.0 - band_frac)))
++    mask_cropped = mask.copy()
++    mask_cropped[:cutoff_y, :] = 0
++
++    # 1. Morphological close to bridge minor track discontinuities
++    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
++    m_closed = cv2.morphologyEx(mask_cropped, cv2.MORPH_CLOSE, close_kernel)
++
++    # 2. Filter to largest connected component (eliminates isolated distant outliers/reflections)
++    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(m_closed)
++    if num_labels <= 1:
++        return None
++    largest = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
++    if stats[largest, cv2.CC_STAT_AREA] < min_mass:
++        return None
++    clean_mask = np.where(labels == largest, 255, 0).astype(np.uint8)
++
++    m_small = cv2.resize(clean_mask, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
++    hs, ws = m_small.shape
++
++    # 3. Standard morphological skeletonization
++    skel = np.zeros_like(m_small)
++    element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
++    temp = m_small.copy()
++    while True:
++        eroded = cv2.erode(temp, element)
++        opened = cv2.morphologyEx(eroded, cv2.MORPH_OPEN, element)
++        subset = cv2.subtract(eroded, opened)
++        skel = cv2.bitwise_or(skel, subset)
++        temp = eroded
++        if cv2.countNonZero(temp) == 0:
++            break
++
++    # Filter skeleton to significant components (eliminate tiny 1-3 px detached nubs)
++    n_skel, l_skel, s_skel, _ = cv2.connectedComponentsWithStats(skel, connectivity=8)
++    if n_skel <= 1:
++        return None
++    max_skel_area = np.max(s_skel[1:, cv2.CC_STAT_AREA])
++    valid_comps = [i for i in range(1, n_skel) if s_skel[i, cv2.CC_STAT_AREA] >= max(5, int(max_skel_area * 0.05))]
++    if len(valid_comps) > 0:
++        skel = np.where(np.isin(l_skel, valid_comps), 255, 0).astype(np.uint8)
++
++    ys, xs = np.where(skel > 0)
++    if len(xs) < 15:
++        return None
++
++    skel_set = set(zip(xs.tolist(), ys.tolist()))
++    bottom_max_y = np.max(ys)
++    candidates = np.where(ys >= bottom_max_y - 8)[0]
++    start_idx = candidates[np.argmin(np.abs(xs[candidates] - ws / 2))]
++    start_pt = (int(xs[start_idx]), int(ys[start_idx]))
++
++    # 4. BFS graph traversal to find the longest continuous path along the track
++    visited = {start_pt: 0.0}
++    parent = {start_pt: None}
++    queue = deque([start_pt])
++    farthest_node = start_pt
++    max_dist = 0.0
++
++    while queue:
++        curr = queue.popleft()
++        cx, cy = curr
++        d_curr = visited[curr]
++        if d_curr > max_dist:
++            max_dist = d_curr
++            farthest_node = curr
++
++        for dx in range(-6, 7):
++            for dy in range(-6, 7):
++                if dx == 0 and dy == 0:
++                    continue
++                nbr = (cx + dx, cy + dy)
++                if nbr in skel_set and nbr not in visited:
++                    visited[nbr] = d_curr + np.hypot(dx, dy)
++                    parent[nbr] = curr
++                    queue.append(nbr)
++
++    path = []
++    curr = farthest_node
++    while curr is not None:
++        path.append(curr)
++        curr = parent[curr]
++    path.reverse()
++
++    if len(path) < 15 or max_dist < 20.0:
++        return None
++
++    pts = np.array([[pt[0] / ws, pt[1] / hs] for pt in path], dtype=np.float64)
++    return resample_path(pts, num_samples=num_samples)
++
++
++def synchronize_point_extents(
++    pts_a: np.ndarray | None,
++    pts_b: np.ndarray | None,
++) -> tuple[np.ndarray | None, np.ndarray | None]:
++    """
++    Truncate two extracted centerline point sets [N, 2] to their common vertical (y) domain.
++    Prevents artificial L2 error spikes caused by one curve extending slightly further
++    into the horizon or camera foreground than the other.
++    """
++    if pts_a is None or pts_b is None or len(pts_a) == 0 or len(pts_b) == 0:
++        return pts_a, pts_b
++
++    common_min_y = max(float(pts_a[:, 1].min()), float(pts_b[:, 1].min()))
++    common_max_y = min(float(pts_a[:, 1].max()), float(pts_b[:, 1].max()))
++
++    if common_min_y >= common_max_y:
++        return pts_a, pts_b
++
++    mask_a = (pts_a[:, 1] >= common_min_y) & (pts_a[:, 1] <= common_max_y)
++    mask_b = (pts_b[:, 1] >= common_min_y) & (pts_b[:, 1] <= common_max_y)
++
++    sub_a = pts_a[mask_a]
++    sub_b = pts_b[mask_b]
++
++    # Return truncated if sufficient points remain, else original
++    if len(sub_a) >= 15 and len(sub_b) >= 15:
++        return sub_a, sub_b
++    return pts_a, pts_b
++
++
++def extract_centerline_points(
++    mask: np.ndarray,
++    band_frac: float = 0.8,
++    min_mass: int = 15,
++    method: str = "scan",
++    max_jump_px: float = 120.0,
++    max_gap_rows: int = 25,
++    stitch_horizon_islands: bool = True,
++) -> np.ndarray | None:
++    """
++    Extract track centerline points from bottom to top within the vertical band fraction.
++
++    Features:
++        - Contiguous horizontal span/interval tracking (handles wide turns and hairpin curves without clipping).
++        - Trajectory-guided horizon island stitching (recovers thin distant track severed by sub-pixel noise).
++        - Resolution-adaptive overlap tolerances.
++
++    Args:
++        mask: uint8 binary mask (0 or 255).
++        band_frac: Vertical band fraction from bottom [0, 1].
++        min_mass: Minimum number of active pixels required.
++        method:
++          - 'scan': Robust contiguous span scanner with continuity tracking and horizon stitching.
++          - 'skeleton': Morphological skeletonization + geodesic BFS graph traversal.
++        max_jump_px: Maximum allowable horizontal displacement between consecutive rows.
++        max_gap_rows: Maximum consecutive empty rows before terminating upward traversal.
++        stitch_horizon_islands: Whether to stitch aligned distant track islands into the main component.
++
++    Returns:
++        pts: Array of shape [N, 2] in normalized coordinates [0, 1] x [0, 1], or None if track is absent.
++    """
++    if method == "skeleton":
++        pts = extract_skeleton_centerline(mask, band_frac=band_frac, min_mass=min_mass)
++        if pts is not None:
++            return pts
++
++    h, w = mask.shape[:2]
++    if np.count_nonzero(mask) < min_mass:
++        return None
++
++    cutoff_y = int(round(h * (1.0 - band_frac)))
++    mask_cropped = mask.copy()
++    mask_cropped[:cutoff_y, :] = 0
++
++    # 1. Morphological closing to bridge minor tears along the track
++    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
++    m_closed = cv2.morphologyEx(mask_cropped, cv2.MORPH_CLOSE, close_kernel)
++    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(m_closed)
++    if num_labels <= 1:
++        return None
++    largest = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
++    if stats[largest, cv2.CC_STAT_AREA] < min_mass:
++        return None
++    active_mask = np.where(labels == largest, 255, 0).astype(np.uint8)
++
++    # 2. Trajectory-guided horizon island stitching
++    # In real photos, perspective causes distant track to thin to 2-3 px, creating tiny breaks.
++    # We iteratively fuse candidate components that align with the forward trajectory of the track.
++    if stitch_horizon_islands:
++        while True:
++            ys, xs = np.where(active_mask > 0)
++            if len(ys) == 0:
++                break
++            top_y = ys.min()
++            top_xs = xs[ys <= top_y + 8]
++            top_center_x = float(np.mean(top_xs))
++
++            best_candidate = None
++            min_dist = float("inf")
++            for label_id in range(1, num_labels):
++                if stats[label_id, cv2.CC_STAT_AREA] < 25:
++                    continue
++                c_stat = stats[label_id]
++                c_top = c_stat[cv2.CC_STAT_TOP]
++                c_bottom = c_top + c_stat[cv2.CC_STAT_HEIGHT]
++                c_center_x = c_stat[cv2.CC_STAT_LEFT] + c_stat[cv2.CC_STAT_WIDTH] / 2.0
++
++                gap_y = top_y - c_bottom
++                # Candidate must lie above or slightly overlap top_y, and extend higher into the horizon
++                if -25 <= gap_y <= 35 and c_top < top_y:
++                    gap_x = abs(c_center_x - top_center_x)
++                    if gap_x <= max(150.0, w * 0.05):
++                        dist = abs(gap_y) + gap_x * 0.2
++                        if dist < min_dist:
++                            min_dist = dist
++                            best_candidate = label_id
++
++            if best_candidate is not None:
++                active_mask = np.where(labels == best_candidate, 255, active_mask)
++                stats[best_candidate, cv2.CC_STAT_AREA] = 0  # Consume candidate
++            else:
++                break
++
++    # 3. Contiguous horizontal span/interval tracking from bottom to top
++    pts = []
++    last_span = None  # (min_x, max_x, center_x)
++    gap_count = 0
++    overlap_margin = max(35.0, w * 0.025)
++    max_jump = max(max_jump_px, w * 0.05)
++
++    for y in range(h - 1, cutoff_y - 1, -1):
++        xs = np.where(active_mask[y, :] > 0)[0]
++        if len(xs) > 0:
++            # Segment row pixels into contiguous runs (split where gap between adjacent pixels > 15px)
++            splits = np.where(np.diff(xs) > 15)[0]
++            runs = [(float(r.min()), float(r.max()), float(r.mean())) for r in np.split(xs, splits + 1)]
++
++            if last_span is not None:
++                prev_min, prev_max, prev_center = last_span
++                best_run = None
++                best_dist = float("inf")
++
++                # Check for direct horizontal overlap/adjacency with previous row
++                for r_min, r_max, r_center in runs:
++                    if r_min <= prev_max + overlap_margin and r_max >= prev_min - overlap_margin:
++                        dist = abs(r_center - prev_center)
++                        if dist < best_dist:
++                            best_dist = dist
++                            best_run = (r_min, r_max, r_center)
++
++                # Fallback: closest run by edge-to-edge distance
++                if best_run is None:
++                    for r_min, r_max, r_center in runs:
++                        dist = min(abs(r_min - prev_max), abs(r_max - prev_min))
++                        if dist < best_dist:
++                            best_dist = dist
++                            best_run = (r_min, r_max, r_center)
++
++                # Reject jumps larger than max_jump
++                if best_dist > max_jump:
++                    gap_count += 1
++                    if gap_count > max_gap_rows:
++                        break
++                    continue
++
++                last_span = best_run
++                pts.append([best_run[2] / w, float(y) / h])
++                gap_count = 0
++            else:
++                # Bottom-most row: pick run closest to image center
++                best_run = min(runs, key=lambda r: abs(r[2] - w / 2.0))
++                last_span = best_run
++                pts.append([best_run[2] / w, float(y) / h])
++                gap_count = 0
++        else:
++            if last_span is not None:
++                gap_count += 1
++                if gap_count > max_gap_rows:
++                    break
++
++    if len(pts) < 15:
++        return None
++    return np.array(pts, dtype=np.float64)
++
++
++# --------------------------------------------------------------------------- #
++# Differentiable PyTorch Pipeline (for simple_trainer.py training loop)
++# --------------------------------------------------------------------------- #
++if TORCH_AVAILABLE:
++    BERNSTEIN_GRAM_4x4_TORCH = torch.tensor(
++        [
++            [20.0, 10.0, 4.0, 1.0],
++            [10.0, 12.0, 9.0, 4.0],
++            [4.0, 9.0, 12.0, 10.0],
++            [1.0, 4.0, 10.0, 20.0],
++        ],
++        dtype=torch.float32,
++    ) / 140.0
++
++    def cubic_bezier_basis_torch(u: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++        """Cubic Bernstein basis functions for u in [0, 1] on PyTorch tensors."""
++        u_c = torch.clamp(u, 0.0, 1.0)
++        one_minus_u = 1.0 - u_c
++        b0 = one_minus_u ** 3
++        b1 = 3.0 * (one_minus_u ** 2) * u_c
++        b2 = 3.0 * one_minus_u * (u_c ** 2)
++        b3 = u_c ** 3
++        return b0, b1, b2, b3
++
++    def compute_chord_parameters_torch(points: torch.Tensor) -> torch.Tensor:
++        """Compute normalized chord-length parameter u in [0, 1] for points: [N, 2]."""
++        diffs = points[1:] - points[:-1]
++        chord_lengths = torch.norm(diffs, dim=-1)
++        cum = torch.cat([torch.zeros(1, dtype=points.dtype, device=points.device), torch.cumsum(chord_lengths, dim=0)])
++        total_length = cum[-1]
++        safe_total = torch.where(total_length > 1e-7, total_length, torch.ones_like(total_length))
++        return torch.clamp(cum / safe_total, 0.0, 1.0)
++
++    def fit_n_cubic_splines_torch(
++        points: torch.Tensor,
++        num_segments: int = 3,
++        continuity: str = "C1",
++        pin_endpoints: bool = True,
++        reg_lambda: float = 1e-6,
++    ) -> torch.Tensor:
++        """
++        Differentiable global linear least-squares fitting of N cubic Bézier segments to 2D points.
++        Guarantees exact C0 (position) and C1 (tangent vector) continuity at all internal junctions.
++        Fully backpropagatable through torch.linalg.solve.
++
++        Args:
++            points: [N_pts, 2] tensor of 2D points in normalized coordinates [0, 1] x [0, 1].
++            num_segments: Number of cubic segments N >= 1.
++            continuity: 'C1' (tangent vector continuity) or 'C0' (position continuity).
++            pin_endpoints: If True, fixes curve start to points[0] and end to points[-1].
++            reg_lambda: Tikhonov regularization factor for AtA inversion.
++
++        Returns:
++            ctrl_pts: [num_segments, 4, 2] control points tensor.
++        """
++        device = points.device
++        dtype = points.dtype
++        n_pts = points.shape[0]
++
++        if n_pts < 4:
++            p0 = points[0]
++            p3 = points[-1]
++            t_vals = torch.linspace(0.0, 1.0, num_segments + 1, dtype=dtype, device=device)
++            juncs = [p0 + (p3 - p0) * t for t in t_vals]
++            out = []
++            for s in range(num_segments):
++                s0 = juncs[s]
++                s3 = juncs[s + 1]
++                s1 = s0 + (s3 - s0) * (1.0 / 3.0)
++                s2 = s0 + (s3 - s0) * (2.0 / 3.0)
++                out.append(torch.stack([s0, s1, s2, s3], dim=0))
++            return torch.stack(out, dim=0)
++
++        u_global = compute_chord_parameters_torch(points)
++        seg_breaks = torch.linspace(0.0, 1.0, num_segments + 1, dtype=dtype, device=device)
++
++        seg_indices = torch.clamp(torch.floor(u_global * num_segments).long(), 0, num_segments - 1)
++        seg_start = seg_breaks[seg_indices]
++        seg_len = seg_breaks[seg_indices + 1] - seg_start
++        u_local = torch.clamp((u_global - seg_start) / seg_len, 0.0, 1.0)
++
++        b0, b1, b2, b3 = cubic_bezier_basis_torch(u_local)
++        basis = torch.stack([b0, b1, b2, b3], dim=-1)  # [N, 4]
++
++        n_vars = 2 * num_segments if pin_endpoints else 2 * num_segments + 2
++        coeff = torch.zeros((num_segments, 4, n_vars), dtype=dtype, device=device)
++        const = torch.zeros((num_segments, 4, 2), dtype=dtype, device=device)
++
++        p_start = points[0]
++        p_end = points[-1]
++
++        if continuity.upper() == "C1":
++            if pin_endpoints:
++                const[0, 0] = p_start
++                coeff[0, 1, 0] = 1.0
++                coeff[0, 2, 1] = 1.0
++                if num_segments == 1:
++                    const[0, 3] = p_end
++                else:
++                    coeff[0, 3, 2] = 1.0
++                for s in range(1, num_segments):
++                    idx_Js = 2 * s
++                    idx_prev_p2 = 2 * s - 1
++                    idx_ps2 = 2 * s + 1
++                    coeff[s, 0, idx_Js] = 1.0
++                    coeff[s, 1, idx_Js] += 2.0
++                    coeff[s, 1, idx_prev_p2] -= 1.0
++                    coeff[s, 2, idx_ps2] = 1.0
++                    if s == num_segments - 1:
++                        const[s, 3] = p_end
++                    else:
++                        coeff[s, 3, 2 * (s + 1)] = 1.0
++            else:
++                coeff[0, 0, 0] = 1.0
++                coeff[0, 1, 1] = 1.0
++                coeff[0, 2, 2] = 1.0
++                coeff[0, 3, 3] = 1.0
++                for s in range(1, num_segments):
++                    idx_Js = 2 * s + 1
++                    idx_prev_p2 = 2 * s
++                    idx_ps2 = 2 * s + 2
++                    coeff[s, 0, idx_Js] = 1.0
++                    coeff[s, 1, idx_Js] += 2.0
++                    coeff[s, 1, idx_prev_p2] -= 1.0
++                    coeff[s, 2, idx_ps2] = 1.0
++                    if s == num_segments - 1:
++                        coeff[s, 3, 2 * s + 3] = 1.0
++                    else:
++                        coeff[s, 3, 2 * (s + 1) + 1] = 1.0
++        else:
++            n_vars = 3 * num_segments - 1 if pin_endpoints else 3 * num_segments + 1
++            coeff = torch.zeros((num_segments, 4, n_vars), dtype=dtype, device=device)
++            const = torch.zeros((num_segments, 4, 2), dtype=dtype, device=device)
++            const[0, 0] = p_start
++            var_idx = 0
++            for s in range(num_segments):
++                if s > 0:
++                    coeff[s, 0] = coeff[s - 1, 3]
++                coeff[s, 1, var_idx] = 1.0
++                var_idx += 1
++                coeff[s, 2, var_idx] = 1.0
++                var_idx += 1
++                if s == num_segments - 1 and pin_endpoints:
++                    const[s, 3] = p_end
++                else:
++                    coeff[s, 3, var_idx] = 1.0
++                    var_idx += 1
++
++        coeff_pts = coeff[seg_indices]
++        const_pts = const[seg_indices]
++
++        A = torch.sum(basis.unsqueeze(-1) * coeff_pts, dim=1)
++        offset = torch.sum(basis.unsqueeze(-1) * const_pts, dim=1)
++        B = points - offset
++
++        AtA = A.t() @ A
++        AtB = A.t() @ B
++        reg = torch.eye(n_vars, dtype=dtype, device=device) * reg_lambda
++        X = torch.linalg.solve(AtA + reg, AtB)
++
++        ctrl_pts = torch.einsum("skv, vd -> skd", coeff, X) + const
++        return ctrl_pts
++
++    def fit_three_cubic_bsplines_torch(pts: torch.Tensor) -> torch.Tensor:
++        """Backward-compatible alias: fit 3 C1 cubic splines to pts: [N, 2]."""
++        return fit_n_cubic_splines_torch(pts, num_segments=3, continuity="C1")
++
++    def exact_integrated_l2_error_torch(
++        ctrl_render: torch.Tensor,
++        ctrl_target: torch.Tensor,
++        img_w: float | None = None,
++        img_h: float | None = None,
++    ) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
++        """
++        Exact integrated L2 error between two cubic B-spline curves using the Gram matrix.
++        ctrl_render: [num_segments, 4, 2]
++        ctrl_target: [num_segments, 4, 2]
++        If img_w and img_h are provided, returns (err_norm, err_px).
++        """
++        M = BERNSTEIN_GRAM_4x4_TORCH.to(dtype=ctrl_render.dtype, device=ctrl_render.device)
++        diff = ctrl_render - ctrl_target
++
++        seg_errors = []
++        seg_errors_px = []
++        for s in range(diff.shape[0]):
++            dx = diff[s, :, 0]
++            dy = diff[s, :, 1]
++            err2_x = dx @ M @ dx
++            err2_y = dy @ M @ dy
++            err2_norm = err2_x + err2_y
++            seg_errors.append(torch.sqrt(err2_norm.clamp_min(1e-8)))
++            if img_w is not None and img_h is not None:
++                err2_px = (img_w**2) * err2_x + (img_h**2) * err2_y
++                seg_errors_px.append(torch.sqrt(err2_px.clamp_min(1e-8)))
++
++        err_norm = torch.stack(seg_errors).mean()
++        if img_w is not None and img_h is not None:
++            err_px = torch.stack(seg_errors_px).mean()
++            return err_norm, err_px
++        return err_norm
++
++    compute_exact_integrated_l2_torch = exact_integrated_l2_error_torch
++
++    def rgb_to_hsv_torch(rgb: torch.Tensor) -> torch.Tensor:
++        """Differentiable RGB -> HSV conversion in OpenCV conventions [0..180, 0..255, 0..255]."""
++        r, g, b = rgb.unbind(dim=-1)
++        max_val, _ = torch.max(rgb, dim=-1)
++        min_val, _ = torch.min(rgb, dim=-1)
++        c = max_val - min_val
++        v = max_val
++        s = torch.where(max_val > 1e-6, c / (max_val + 1e-6), torch.zeros_like(max_val))
++        h = torch.where(
++            c < 1e-6,
++            torch.zeros_like(c),
++            torch.where(
++                max_val == r,
++                ((g - b) / (c + 1e-6)) % 6.0,
++                torch.where(
++                    max_val == g,
++                    ((b - r) / (c + 1e-6)) + 2.0,
++                    ((r - g) / (c + 1e-6)) + 4.0,
++                ),
++            ),
++        )
++        h = torch.where(c > 1e-6, h * 30.0, torch.zeros_like(h))
++        return torch.stack([h, s * 255.0, v * 255.0], dim=-1)
++
++    def soft_orange_mask_torch(
++        images: torch.Tensor,
++        hsv_lower=(0, 110, 100),
++        hsv_upper=(19, 255, 255),
++        tau=(2.5, 10.0, 10.0),
++    ) -> torch.Tensor:
++        """
++        images: [B, H, W, 3] RGB float tensor in [0, 1].
++        Returns soft probability mask: [B, H, W] in [0, 1].
++        """
++        hsv = rgb_to_hsv_torch(images)
++        lo = torch.tensor(hsv_lower, dtype=hsv.dtype, device=hsv.device)
++        hi = torch.tensor(hsv_upper, dtype=hsv.dtype, device=hsv.device)
++        t = torch.tensor(tau, dtype=hsv.dtype, device=hsv.device)
++
++        m = (torch.sigmoid((hsv - lo) / t) * torch.sigmoid((hi - hsv) / t)).prod(dim=-1)
++        m = m.unsqueeze(1)  # [B, 1, H, W]
++
++        # Soft morphology open: erode (min_pool) followed by dilate (max_pool)
++        m = -F.max_pool2d(-m, kernel_size=3, stride=1, padding=1)
++        m = F.max_pool2d(m, kernel_size=3, stride=1, padding=1)
++        return m.squeeze(1)  # [B, H, W]
++
++    def extract_centerline_points_torch(
++        mask: torch.Tensor,
++        band_frac: float = 0.8,
++        num_rows: int = 36,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """
++        Extract centerline points starting from the bottom of the image towards the top.
++        mask: [H, W] soft orange mask in [0, 1].
++        band_frac: height fraction measured from the bottom of the image.
++        num_rows: number of sample rows to extract.
++
++        Returns:
++            pts: [num_rows, 2] in normalized coordinates [0, 1] x [0, 1]
++            row_mass: [num_rows] sum of weights across each row
++        """
++        H, W = mask.shape
++        band_h = max(num_rows, int(round(H * band_frac)))
++
++        y_indices = torch.linspace(H - 1, H - band_h, steps=num_rows, device=mask.device).round().long()
++        y_indices = y_indices.clamp(0, H - 1)
++
++        row_slices = mask[y_indices, :]  # [num_rows, W]
++        row_mass = row_slices.sum(dim=-1)  # [num_rows]
++
++        x_coords = torch.arange(W, dtype=mask.dtype, device=mask.device)
++        expected_x = (row_slices * x_coords).sum(dim=-1) / row_mass.clamp_min(1e-6)
++
++        norm_x = expected_x / float(max(1, W - 1))
++        norm_y = y_indices.to(mask.dtype) / float(max(1, H - 1))
++
++        pts = torch.stack([norm_x, norm_y], dim=-1)  # [num_rows, 2]
++        return pts, row_mass
++
++    def spline_loss_torch(
++        render: torch.Tensor | None = None,
++        target: torch.Tensor | None = None,
++        band_frac: float = 0.8,
++        hsv_lower=(0, 110, 100),
++        hsv_upper=(19, 255, 255),
++        min_frac: float = 0.002,
++        tau=(2.5, 10.0, 10.0),
++        mask_render: torch.Tensor | None = None,
++        mask_target: torch.Tensor | None = None,
++        num_segments: int = 3,
++        continuity: str = "C1",
++    ) -> torch.Tensor:
++        """
++        Differentiable spline loss fitting N tangent-continuous cubic splines to render and target.
++        """
++        if mask_render is None:
++            assert render is not None, "Either render or mask_render must be provided"
++            mask_render = soft_orange_mask_torch(render, hsv_lower, hsv_upper, tau)
++        if mask_target is None:
++            assert target is not None, "Either target or mask_target must be provided"
++            mask_target = soft_orange_mask_torch(target.detach(), hsv_lower, hsv_upper, tau)
++
++        B, H, W = mask_render.shape
++        losses = []
++        min_mass = min_frac * H * W * band_frac
++
++        for b in range(B):
++            m_r = mask_render[b]
++            m_t = mask_target[b]
++
++            mass_r = m_r.sum()
++            mass_t = m_t.sum()
++
++            if mass_t < min_mass or mass_r < min_mass:
++                continue
++
++            pts_t, _ = extract_centerline_points_torch(m_t, band_frac=band_frac)
++            ctrl_t = fit_n_cubic_splines_torch(pts_t, num_segments=num_segments, continuity=continuity).detach()
++
++            pts_r, _ = extract_centerline_points_torch(m_r, band_frac=band_frac)
++            ctrl_r = fit_n_cubic_splines_torch(pts_r, num_segments=num_segments, continuity=continuity)
++
++            l2_err = exact_integrated_l2_error_torch(ctrl_r, ctrl_t)
++            losses.append(l2_err)
++
++        if not losses:
++            return mask_render.sum() * 0.0
++        return torch.stack(losses).mean()
++
++    def eval_spline_error_torch(
++        render: torch.Tensor,
++        target: torch.Tensor,
++        band_frac: float = 0.8,
++        hsv_lower=(0, 110, 100),
++        hsv_upper=(19, 255, 255),
++        min_frac: float = 0.002,
++        num_segments: int = 3,
++        continuity: str = "C1",
++    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[None, None]:
++        """Non-training evaluation: returns (err_norm, err_px) or (None, None) if track missing."""
++        with torch.no_grad():
++            m_r = soft_orange_mask_torch(render.unsqueeze(0), hsv_lower, hsv_upper)[0]
++            m_t = soft_orange_mask_torch(target.unsqueeze(0), hsv_lower, hsv_upper)[0]
++            H, W = m_r.shape
++            min_mass = min_frac * H * W * band_frac
++            if m_t.sum() < min_mass or m_r.sum() < min_mass:
++                return None, None
++            pts_r, _ = extract_centerline_points_torch(m_r, band_frac)
++            pts_t, _ = extract_centerline_points_torch(m_t, band_frac)
++            ctrl_r = fit_n_cubic_splines_torch(pts_r, num_segments=num_segments, continuity=continuity)
++            ctrl_t = fit_n_cubic_splines_torch(pts_t, num_segments=num_segments, continuity=continuity)
++            return exact_integrated_l2_error_torch(ctrl_r, ctrl_t, img_w=float(W), img_h=float(H))
++
++
++# --------------------------------------------------------------------------- #
++# Standalone CLI Interface
++# --------------------------------------------------------------------------- #
++def main():
++    parser = argparse.ArgumentParser(
++        description="Fit N tangent-continuous (C1) cubic B-splines to orange track in image."
++    )
++    parser.add_argument("image", type=Path, help="Path to input track image (.jpg or .png)")
++    parser.add_argument("-o", "--output", type=Path, default=None, help="Save visualization to file")
++    parser.add_argument("-n", "--segments", type=int, default=3, help="Number of cubic spline segments (default: 3)")
++    parser.add_argument("--continuity", choices=["C0", "C1"], default="C1", help="Continuity level: 'C1' (tangent) or 'C0'")
++    parser.add_argument("--band-frac", type=float, default=0.8, help="Vertical band fraction from bottom (default: 0.8)")
++    parser.add_argument("--hsv-lower", nargs=3, type=int, default=[1, 53, 145], metavar=("H", "S", "V"), help="Lower HSV limit")
++    parser.add_argument("--hsv-upper", nargs=3, type=int, default=[7, 255, 255], metavar=("H", "S", "V"), help="Upper HSV limit")
++    parser.add_argument("--method", choices=["scan", "skeleton"], default="scan", help="Centerline method")
++
++    args = parser.parse_args()
++
++    if not args.image.exists():
++        print(f"[Error] Image not found: {args.image}")
++        sys.exit(1)
++
++    img = cv2.imread(str(args.image))
++    if img is None:
++        print(f"[Error] Failed to load image: {args.image}")
++        sys.exit(1)
++
++    h, w = img.shape[:2]
++    print(f"\nLoaded image: {args.image.name} ({w}x{h})")
++
++    # Segment orange track
++    masked_img, mask, count = extract_orange_pixels(img, tuple(args.hsv_lower), tuple(args.hsv_upper))
++    print(f"Detected orange pixels: {count:,} px")
++
++    pts = extract_centerline_points(mask, band_frac=args.band_frac, method=args.method)
++    if pts is None or len(pts) < 10:
++        print("[Error] Failed to extract sufficient centerline points.")
++        sys.exit(1)
++
++    print(f"Extracted {len(pts)} centerline points using '{args.method}' method.")
++    ctrl_pts = fit_n_cubic_splines(pts, num_segments=args.segments, continuity=args.continuity)
++    print(f"Fitted {args.segments} {args.continuity}-continuous cubic spline segments.")
++    print(f"Control points shape: {ctrl_pts.shape}")
++
++    for s in range(args.segments):
++        print(f"\n--- Segment {s + 1} (4 Control Points) ---")
++        for k in range(4):
++            nx, ny = ctrl_pts[s, k]
++            px, py = nx * w, ny * h
++            print(f"  P{k}: norm=({nx:.4f}, {ny:.4f}) -> pixel=({px:.1f}px, {py:.1f}px)")
++
++    # Render on copy of image
++    vis = img.copy()
++    draw_spline_curve(vis, ctrl_pts, color=(0, 255, 0), thickness=3, draw_dots=True, draw_tangents=True)
++
++    if args.output:
++        cv2.imwrite(str(args.output), vis)
++        print(f"\nSaved visualization to: {args.output}")
++
++
++if __name__ == "__main__":
++    main()

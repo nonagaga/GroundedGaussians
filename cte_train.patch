@@ -1,0 +1,349 @@
+diff --git a/examples/constraints.txt b/examples/constraints.txt
+new file mode 100644
+index 00000000..b87b1ca7
+--- /dev/null
++++ b/examples/constraints.txt
+@@ -0,0 +1,3 @@
++# constraints.txt
++torch==2.14.0+cu130
++torchvision==0.29.0+cu130
+\ No newline at end of file
+diff --git a/examples/cte_loss.py b/examples/cte_loss.py
+new file mode 100644
+index 00000000..da7bd927
+--- /dev/null
++++ b/examples/cte_loss.py
+@@ -0,0 +1,132 @@
++import cv2
++import numpy as np
++import torch
++import torch.nn.functional as F
++
++
++# ---------------------------------------------------------------------------
++# Original hard (non-differentiable) detector -- use for eval / label checks.
++# ---------------------------------------------------------------------------
++def detect_track_centroid(frame, band_frac, hsv_lower, hsv_upper, min_frac=0.002):
++    """
++    Find the x centroid of orange pixels in the bottom `band_frac` of the frame.
++    Returns x (float, full-frame pixel coords) or None if no track is found.
++    `frame` is a BGR uint8 image.
++    """
++    h, _ = frame.shape[:2]
++    band_h = max(1, int(round(h * band_frac)))
++    band = frame[h - band_h :]
++
++    hsv = cv2.cvtColor(band, cv2.COLOR_BGR2HSV)
++    mask = cv2.inRange(hsv, np.array(hsv_lower), np.array(hsv_upper))
++    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
++
++    m = cv2.moments(mask, binaryImage=True)
++    if m["m00"] < min_frac * mask.size:
++        return None
++    return m["m10"] / m["m00"]
++
++
++def hard_cte(image, band_frac, hsv_lower, hsv_upper, min_frac=0.002):
++    """image: [H, W, 3] RGB float tensor in [0, 1]. Returns CTE px, or None on failure."""
++    rgb = (image.detach().clamp(0, 1).cpu().numpy() * 255).round().astype(np.uint8)
++    bgr = np.ascontiguousarray(rgb[..., ::-1])
++    x = detect_track_centroid(bgr, band_frac, hsv_lower, hsv_upper, min_frac)
++    return None if x is None else x - image.shape[1] / 2.0
++
++
++# ---------------------------------------------------------------------------
++# Differentiable torch port -- use for the training loss.
++# ---------------------------------------------------------------------------
++def rgb_to_hsv_cv(rgb: torch.Tensor) -> torch.Tensor:
++    """[..., 3] RGB in [0,1] -> HSV in OpenCV uint8 scale (H 0-180, S/V 0-255)."""
++    r, g, b = rgb.unbind(-1)
++    v, _ = rgb.max(-1)
++    mn, _ = rgb.min(-1)
++    c = v - mn
++    c_safe = c.clamp_min(1e-6)
++    s = c / v.clamp_min(1e-6)
++
++    h = torch.where(
++        v == r,
++        ((g - b) / c_safe) % 6.0,
++        torch.where(v == g, (b - r) / c_safe + 2.0, (r - g) / c_safe + 4.0),
++    )
++    h = torch.where(c > 1e-6, h * 30.0, torch.zeros_like(h))  # 60 deg / 2 = 30
++    return torch.stack([h, s * 255.0, v * 255.0], dim=-1)
++
++
++def soft_track_centroid(
++    images, band_frac, hsv_lower, hsv_upper, min_frac=0.002, tau=(2.0, 10.0, 10.0)
++):
++    """
++    images: [B, H, W, 3] RGB in [0, 1].
++    Returns (centroid_x [B], found [B] bool, mass [B], min_mass float).
++    """
++    B, H, W, _ = images.shape
++    band_h = max(1, int(round(H * band_frac)))
++    band = images[:, H - band_h :].clamp(0, 1)
++
++    hsv = rgb_to_hsv_cv(band)
++    lo = torch.tensor(hsv_lower, dtype=hsv.dtype, device=hsv.device)
++    hi = torch.tensor(hsv_upper, dtype=hsv.dtype, device=hsv.device)
++    t = torch.tensor(tau, dtype=hsv.dtype, device=hsv.device)
++
++    # Soft cv2.inRange: product of per-channel soft step functions.
++    m = (torch.sigmoid((hsv - lo) / t) * torch.sigmoid((hi - hsv) / t)).prod(-1)
++    m = m[:, None]  # [B, 1, h, W]
++
++    # Soft MORPH_OPEN with a 3x3 kernel: erode then dilate.
++    m = -F.max_pool2d(-m, 3, 1, 1)
++    m = F.max_pool2d(m, 3, 1, 1)
++
++    mass = m.sum(dim=(1, 2, 3))
++    min_mass = min_frac * band_h * W
++    col = m.sum(dim=(1, 2))  # [B, W]
++    xs = torch.arange(W, device=m.device, dtype=m.dtype)
++    centroid = (col * xs).sum(-1) / mass.clamp_min(1e-6)
++    return centroid, mass >= min_mass, mass, min_mass
++
++
++def cte_loss(
++    images,
++    cte_labels,
++    band_frac,
++    hsv_lower,
++    hsv_upper,
++    min_frac=0.002,
++    tau=(2.0, 10.0, 10.0),
++    label_width=None,
++    hinge_weight=1.0,
++):
++    """
++    L1 between detected CTE and labeled CTE, normalized by image width so that
++    the worst case (detection failure) is exactly 1.0.
++
++    images:     [B, H, W, 3] RGB render in [0, 1]
++    cte_labels: [B] pixels (NaN = unlabeled, skipped)
++    label_width: width (px) the labels were measured at; labels are rescaled
++                 to the render width if it differs.
++    """
++    B, H, W, _ = images.shape
++    cte_labels = cte_labels.to(images.dtype)
++    if label_width is not None:
++        cte_labels = cte_labels * (W / label_width)
++
++    cx, found, mass, min_mass = soft_track_centroid(
++        images, band_frac, hsv_lower, hsv_upper, min_frac, tau
++    )
++    pred = cx - W / 2.0
++    err = (pred - cte_labels).abs().clamp(max=W)
++    # Detection failed -> max CTE error (= image width).
++    err = torch.where(found, err, torch.full_like(err, float(W)))
++    loss = err / W
++
++    # A failed detection has a constant error and therefore no gradient.
++    # This hinge pushes the splats to produce more track-colored pixels.
++    loss = loss + hinge_weight * F.relu(1.0 - mass / min_mass) * (~found).float()
++
++    valid = ~torch.isnan(cte_labels)
++    if not valid.any():
++        return images.sum() * 0.0
++    return loss[valid].mean()
+\ No newline at end of file
+diff --git a/examples/datasets/colmap.py b/examples/datasets/colmap.py
+index 5e7e0890..e371d0d3 100644
+--- a/examples/datasets/colmap.py
++++ b/examples/datasets/colmap.py
+@@ -14,6 +14,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import csv
+ import json
+ import os
+ from concurrent.futures import ThreadPoolExecutor
+@@ -102,7 +103,8 @@ def _camera_distortion(camera: Any) -> tuple[np.ndarray, str]:
+         return np.array(params[4:8], dtype=np.float32), "perspective"
+     if model_name == "OPENCV_FISHEYE":
+         return np.array(params[4:8], dtype=np.float32), "fisheye"
+-
++    if model_name == "SIMPLE_RADIAL_FISHEYE":
++        return np.array(params[0:4], dtype=np.float32), "fisheye"
+     raise ValueError(
+         f"Only perspective and fisheye cameras are supported, got {model_name}"
+     )
+@@ -135,6 +137,27 @@ class Parser:
+         self.test_every = test_every
+         self.load_exposure = load_exposure
+ 
++        # CSV is saved in data_dir with filename vision_cte.csv
++        # CSV is formatted as follows:
++        # filename,vision_cte_px
++        # 0001.jpg,-9.91
++
++        # dict where cte[image_name] -> float
++        self.cte: Dict[str, float] = {}
++        cte_file = os.path.join(data_dir, "vision_cte.csv")
++        if os.path.exists(cte_file):
++            with open(cte_file, newline="") as f:
++                reader = csv.DictReader(f)
++                for row in reader:
++                    name = row["filename"].strip()
++                    value = row["vision_cte_px"].strip()
++                    if value == "":
++                        continue
++                    self.cte[name] = float(value)
++            print(f"[Parser] Loaded CTE for {len(self.cte)} images.")
++        else:
++            print(f"[Parser] No CTE file found at {cte_file}.")
++
+         colmap_dir = os.path.join(data_dir, "sparse/0/")
+         if not os.path.exists(colmap_dir):
+             colmap_dir = os.path.join(data_dir, "sparse")
+@@ -531,6 +554,10 @@ class Dataset:
+         if exposure is not None:
+             data["exposure"] = torch.tensor(exposure, dtype=torch.float32)
+ 
++        # Always include the key so default collation works with partial labels
++        cte = self.parser.cte.get(self.parser.image_names[index], float("nan"))
++        data["cte"] = torch.tensor(cte, dtype=torch.float32)
++
+         if self.load_depths:
+             # projected points to image plane to get depths
+             worldtocams = np.linalg.inv(camtoworlds)
+diff --git a/examples/requirements.txt b/examples/requirements.txt
+index 880ee10c..7c7b0815 100644
+--- a/examples/requirements.txt
++++ b/examples/requirements.txt
+@@ -1,15 +1,16 @@
+ # torch, torchvision MUST be pre-installed (internal builds matching each other).
+ # Pin torch here so pip cannot silently downgrade it when resolving transitive
+ # dependencies (e.g. torchvision from PyPI would pull a public torch build).
+-torch==2.9.1
+-nvidia-ncore>=19.0.0
++# --extra-index-url https://download.pytorch.org/whl/cu130
++# torch==2.14.0+cu130
++# nvidia-ncore>=19.0.0
+ 
+ # Official COLMAP Python bindings for data parsing
+ pycolmap>=3.10.0
+ # (optional) nerfacc for torch version rasterization
+ # git+https://github.com/nerfstudio-project/nerfacc
+ 
+-torchvision==0.24.1
++# torchvision==0.24.1
+ viser
+ git+https://github.com/nerfstudio-project/nerfview@4538024fe0d15fd1a0e4d760f3695fc44ca72787
+ imageio[ffmpeg]
+diff --git a/examples/simple_trainer.py b/examples/simple_trainer.py
+index 46fb2ffb..94ff890e 100644
+--- a/examples/simple_trainer.py
++++ b/examples/simple_trainer.py
+@@ -74,6 +74,7 @@ from gsplat.strategy import DefaultStrategy, MCMCStrategy
+ from gsplat_viewer import GsplatViewer, GsplatRenderTabState
+ from nerfview import CameraState, RenderTabState, apply_float_colormap
+ 
++from cte_loss import cte_loss, hard_cte
+ 
+ @dataclass
+ class Config:
+@@ -161,7 +162,7 @@ class Config:
+     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
+     init_extent: float = 3.0
+     # Degree of spherical harmonics
+-    sh_degree: int = 3
++    sh_degree: int = 1
+     # Cast SH coefficients to fp16 before feeding the SH kernel.
+     # Parameters and Adam state stay fp32.
+     sh_fp16: bool = False
+@@ -184,7 +185,7 @@ class Config:
+         default_factory=DefaultStrategy
+     )
+     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
+-    packed: bool = False
++    packed: bool = True
+     # Use sparse gradients for optimization. (experimental)
+     sparse_grad: bool = False
+     # Use visible adam from Taming 3DGS. (experimental)
+@@ -264,6 +265,24 @@ class Config:
+     with_ut: bool = False
+     with_eval3d: bool = False
+ 
++    # Enable CTE loss (requires colmap dataset with vision_cte.csv)
++    cte_loss: bool = True
++    # Weight for CTE loss
++    cte_lambda: float = 0.1
++    # Step at which CTE loss kicks in (geometry should be roughly converged)
++    cte_start_step: int = 5_000
++    # Bottom fraction of the frame used for track detection
++    cte_band_frac: float = 0.25
++    # OpenCV-scale HSV bounds for the orange track (H 0-180, S/V 0-255)
++    cte_hsv_lower: Tuple[int, int, int] = (5, 120, 120)
++    cte_hsv_upper: Tuple[int, int, int] = (25, 255, 255)
++    # Min fraction of band pixels that must be track-colored
++    cte_min_frac: float = 0.002
++    # Softness of the HSV thresholds (H, S, V)
++    cte_tau: Tuple[float, float, float] = (2.0, 10.0, 10.0)
++    # Width (px) at which labels were measured; None = same as rendered width
++    cte_label_width: Optional[float] = None
++
+     def adjust_steps(self, factor: float):
+         self.eval_steps = [int(i * factor) for i in self.eval_steps]
+         self.save_steps = [int(i * factor) for i in self.save_steps]
+@@ -373,7 +392,7 @@ def create_splats_with_optimizers(
+         name: optimizer_class(
+             [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
+             eps=1e-15 / math.sqrt(BS),
+-            # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
++            # IGNORE THIS TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
+             betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+             fused=True,
+         )
+@@ -968,7 +987,23 @@ class Runner:
+             ssimloss = ssim_loss(
+                 colors_ssim.permute(0, 3, 1, 2), pixels_ssim.permute(0, 3, 1, 2)
+             )
++
+             loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
++
++            if cfg.cte_loss and step >= cfg.cte_start_step:
++                            cte_labels = data["cte"].to(device)  # [B], NaN = unlabeled
++                            cteloss = cte_loss(
++                                torch.clamp(colors, 0.0, 1.0),
++                                cte_labels,
++                                band_frac=cfg.cte_band_frac,
++                                hsv_lower=cfg.cte_hsv_lower,
++                                hsv_upper=cfg.cte_hsv_upper,
++                                min_frac=cfg.cte_min_frac,
++                                tau=cfg.cte_tau,
++                                label_width=cfg.cte_label_width,
++                            )
++                            loss = loss + cfg.cte_lambda * cteloss
++
+             if cfg.depth_loss:
+                 # query depths from depth map
+                 points = torch.stack(
+@@ -1032,6 +1067,8 @@ class Runner:
+                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
+                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
+                 self.writer.add_scalar("train/mem", mem, step)
++                if cfg.cte_loss and step >= cfg.cte_start_step:
++                    self.writer.add_scalar("train/cteloss", cteloss.item(), step)
+                 if cfg.depth_loss:
+                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
+                 if cfg.post_processing is not None:
+@@ -1267,6 +1304,17 @@ class Runner:
+                 metrics["psnr"].append(self.psnr(colors_p, pixels_p))
+                 metrics["ssim"].append(self.ssim(colors_p, pixels_p))
+                 metrics["lpips"].append(self.lpips(colors_p, pixels_p))
++
++                if cfg.cte_loss and not torch.isnan(data["cte"]).any():
++                    W = colors.shape[2]
++                    pred = hard_cte(
++                        colors[0], cfg.cte_band_frac,
++                        cfg.cte_hsv_lower, cfg.cte_hsv_upper, cfg.cte_min_frac,
++                    )
++                    label = data["cte"].item()
++                    err = float(W) if pred is None else min(abs(pred - label), W)
++                    metrics["cte_err_px"].append(torch.tensor(err))
++
+                 # Compute color-corrected metrics for fair comparison across methods
+                 if cfg.use_color_correction_metric:
+                     if cfg.color_correct_method == "affine":

@@ -17,11 +17,18 @@
 import json
 import math
 import os
+import sys
 import time
 from collections import defaultdict
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
+
+# Ensure examples dir is in sys.path (do not add repo root or gsplat root to avoid shadowing pre-compiled gsplat)
+_EXAMPLES_DIR = Path(__file__).resolve().parent
+if str(_EXAMPLES_DIR) not in sys.path:
+    sys.path.insert(0, str(_EXAMPLES_DIR))
 
 import imageio
 import numpy as np
@@ -55,6 +62,20 @@ from typing_extensions import Literal, assert_never
 from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
 
 from gsplat import export_splats
+
+# --------------------------------------------------------------------------- #
+# Spline Fit Library Integration
+# --------------------------------------------------------------------------- #
+try:
+    import spline_fit
+    from spline_fit import (
+        fit_n_cubic_splines_torch,
+        fit_three_cubic_bsplines_torch,
+        exact_integrated_l2_error_torch,
+        extract_centerline_points,
+    )
+except ImportError:
+    spline_fit = None
 from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
@@ -108,9 +129,9 @@ def rgb_to_hsv_torch(rgb: torch.Tensor) -> torch.Tensor:
 
 def soft_orange_mask_torch(
     images: torch.Tensor,
-    hsv_lower=(0, 110, 100),
-    hsv_upper=(30, 255, 255),
-    tau=(2.0, 10.0, 10.0),
+    hsv_lower=(0, 27, 182),
+    hsv_upper=(13, 255, 255),
+    tau=(1.5, 3.5, 3.5),
 ) -> torch.Tensor:
     """
     images: [B, H, W, 3] RGB float tensor in [0, 1].
@@ -220,9 +241,12 @@ def fit_cubic_bspline_segment_torch(
 
 def fit_three_cubic_bsplines_torch(pts: torch.Tensor) -> torch.Tensor:
     """
-    Fit 3 sequential cubic B-splines with C0 continuity to pts: [N, 2].
+    Fit 3 sequential cubic B-splines with C1 tangent continuity to pts: [N, 2].
     Returns control_points: [3, 4, 2]
     """
+    if "fit_n_cubic_splines_torch" in globals():
+        return fit_n_cubic_splines_torch(pts, num_segments=3, continuity="C1")
+
     N = pts.shape[0]
     k1 = N // 3
     k2 = (2 * N) // 3
@@ -247,46 +271,70 @@ def fit_three_cubic_bsplines_torch(pts: torch.Tensor) -> torch.Tensor:
 def exact_integrated_l2_error(
     ctrl_render: torch.Tensor,
     ctrl_target: torch.Tensor,
-) -> torch.Tensor:
+    img_w: float | None = None,
+    img_h: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
     """
     Exact integrated L2 error between two cubic B-spline curves using the Gram matrix.
-    ctrl_render: [3, 4, 2]
-    ctrl_target: [3, 4, 2]
+    ctrl_render: [num_segments, 4, 2]
+    ctrl_target: [num_segments, 4, 2]
+    If img_w and img_h are provided, returns (err_norm, err_px).
     """
     M = BERNSTEIN_GRAM_4x4.to(dtype=ctrl_render.dtype, device=ctrl_render.device)
-    diff = ctrl_render - ctrl_target  # [3, 4, 2]
+    diff = ctrl_render - ctrl_target
 
     seg_errors = []
+    seg_errors_px = []
     for s in range(diff.shape[0]):
         dx = diff[s, :, 0]  # [4]
         dy = diff[s, :, 1]  # [4]
-        err2 = dx @ M @ dx + dy @ M @ dy
-        seg_errors.append(torch.sqrt(err2.clamp_min(1e-8)))
-    return torch.stack(seg_errors).mean()
+        err2_x = dx @ M @ dx
+        err2_y = dy @ M @ dy
+        err2_norm = err2_x + err2_y
+        seg_errors.append(torch.sqrt(err2_norm.clamp_min(1e-8)))
+        if img_w is not None and img_h is not None:
+            err2_px = (img_w**2) * err2_x + (img_h**2) * err2_y
+            seg_errors_px.append(torch.sqrt(err2_px.clamp_min(1e-8)))
+
+    err_norm = torch.stack(seg_errors).mean()
+    if img_w is not None and img_h is not None:
+        err_px = torch.stack(seg_errors_px).mean()
+        return err_norm, err_px
+    return err_norm
 
 
 def spline_loss(
-    render: torch.Tensor,
-    target: torch.Tensor,
-    band_frac: float = 0.8,
-    hsv_lower=(0, 110, 100),
-    hsv_upper=(30, 255, 255),
-    min_frac: float = 0.002,
-    tau=(2.0, 10.0, 10.0),
+    render: Optional[torch.Tensor] = None,
+    target: Optional[torch.Tensor] = None,
+    band_frac: float = 0.70,
+    hsv_lower=(0, 27, 182),
+    hsv_upper=(13, 255, 255),
+    min_frac: float = 0.0004,
+    tau=(1.5, 3.5, 3.5),
+    mask_render: Optional[torch.Tensor] = None,
+    mask_target: Optional[torch.Tensor] = None,
+    num_segments: int = 4,
+    continuity: str = "C1",
+    centerline_algorithm: str = "scan",
 ) -> torch.Tensor:
     """
-    Fit 3 cubic B-splines to both rendered splat image and ground-truth image,
+    Fit N cubic B-splines with C1 tangent continuity to both rendered splat image and ground-truth image,
     computing exact integrated L2 curve error.
     Masks out / skips frames where the curve isn't well defined on either render or target.
 
-    render: [B, H, W, 3] in [0, 1]
-    target: [B, H, W, 3] in [0, 1]
+    render: [B, H, W, 3] in [0, 1] (optional if mask_render is provided)
+    target: [B, H, W, 3] in [0, 1] (optional if mask_target is provided)
+    num_segments: Number of C1 cubic spline segments to fit (default: 4)
+    centerline_algorithm: 'scan' (fast row scanner) or 'skeleton' (geodesic graph BFS)
     """
-    B, H, W, _ = render.shape
-    target = target.detach()
+    if mask_render is None:
+        assert render is not None, "Either render or mask_render must be provided"
+        mask_render = soft_orange_mask_torch(render, hsv_lower, hsv_upper, tau)
+    if mask_target is None:
+        assert target is not None, "Either target or mask_target must be provided"
+        mask_target = soft_orange_mask_torch(target.detach(), hsv_lower, hsv_upper, tau)
 
-    mask_render = soft_orange_mask_torch(render, hsv_lower, hsv_upper, tau)
-    mask_target = soft_orange_mask_torch(target, hsv_lower, hsv_upper, tau)
+    B, H, W = mask_render.shape
 
     losses = []
     min_mass = min_frac * H * W * band_frac
@@ -302,41 +350,126 @@ def spline_loss(
         if mass_t < min_mass or mass_r < min_mass:
             continue
 
-        pts_t, _ = extract_centerline_points_torch(m_t, band_frac=band_frac)
-        ctrl_t = fit_three_cubic_bsplines_torch(pts_t).detach()
+        if centerline_algorithm == "skeleton" and spline_fit is not None and hasattr(spline_fit, "extract_centerline_points"):
+            m_t_np = (m_t.clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)
+            pts_t_np = spline_fit.extract_centerline_points(m_t_np, band_frac=band_frac, method="skeleton")
+            if pts_t_np is not None and len(pts_t_np) >= 4:
+                pts_t = torch.from_numpy(pts_t_np).to(dtype=m_t.dtype, device=m_t.device)
+            else:
+                pts_t, _ = extract_centerline_points_torch(m_t, band_frac=band_frac)
+        else:
+            pts_t, _ = extract_centerline_points_torch(m_t, band_frac=band_frac)
 
-        pts_r, _ = extract_centerline_points_torch(m_r, band_frac=band_frac)
-        ctrl_r = fit_three_cubic_bsplines_torch(pts_r)
+        if "fit_n_cubic_splines_torch" in globals():
+            ctrl_t = fit_n_cubic_splines_torch(pts_t, num_segments=num_segments, continuity=continuity).detach()
+        else:
+            ctrl_t = fit_three_cubic_bsplines_torch(pts_t).detach()
+
+        if centerline_algorithm == "skeleton" and spline_fit is not None and hasattr(spline_fit, "extract_centerline_points"):
+            if pts_t is not None and len(pts_t) >= 4:
+                y_levels = (pts_t[:, 1] * float(H - 1)).round().long().clamp(0, H - 1)
+                row_slices = m_r[y_levels, :]
+                row_mass = row_slices.sum(dim=-1)
+                x_coords = torch.arange(W, dtype=m_r.dtype, device=m_r.device)
+                expected_x = (row_slices * x_coords).sum(dim=-1) / row_mass.clamp_min(1e-6)
+                norm_x = expected_x / float(max(1, W - 1))
+                norm_y = y_levels.to(m_r.dtype) / float(max(1, H - 1))
+                pts_r = torch.stack([norm_x, norm_y], dim=-1)
+            else:
+                pts_r, _ = extract_centerline_points_torch(m_r, band_frac=band_frac)
+        else:
+            pts_r, _ = extract_centerline_points_torch(m_r, band_frac=band_frac)
+
+        if "fit_n_cubic_splines_torch" in globals():
+            ctrl_r = fit_n_cubic_splines_torch(pts_r, num_segments=num_segments, continuity=continuity)
+        else:
+            ctrl_r = fit_three_cubic_bsplines_torch(pts_r)
 
         l2_err = exact_integrated_l2_error(ctrl_r, ctrl_t)
         losses.append(l2_err)
 
     if not losses:
-        return render.sum() * 0.0
+        return mask_render.sum() * 0.0
     return torch.stack(losses).mean()
+
+
+def track_dice_loss(
+    render: Optional[torch.Tensor] = None,
+    target: Optional[torch.Tensor] = None,
+    band_frac: float = 0.8,
+    hsv_lower=(0, 110, 100),
+    hsv_upper=(19, 255, 255),
+    tau=(2.5, 10.0, 10.0),
+    smooth: float = 1.0,
+    mask_render: Optional[torch.Tensor] = None,
+    mask_target: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Differentiable Soft Dice loss on orange track masks:
+        L_dice = 1.0 - (2 * sum(M_r * M_t) + smooth) / (sum(M_r) + sum(M_t) + smooth)
+
+    Operates on either [B, H, W, 3] images or precomputed [B, H, W] soft masks in [0, 1].
+    Restricts evaluation to the bottom `band_frac` region of each image.
+    """
+    if mask_render is None:
+        assert render is not None, "Either render or mask_render must be provided"
+        mask_render = soft_orange_mask_torch(render, hsv_lower, hsv_upper, tau)
+    if mask_target is None:
+        assert target is not None, "Either target or mask_target must be provided"
+        mask_target = soft_orange_mask_torch(target.detach(), hsv_lower, hsv_upper, tau)
+
+    if band_frac < 1.0:
+        H = mask_render.shape[1]
+        band_h = max(1, int(round(H * band_frac)))
+        mask_render = mask_render[:, -band_h:, :]
+        mask_target = mask_target[:, -band_h:, :]
+
+    intersection = (mask_render * mask_target).sum(dim=(-2, -1))
+    cardinality = mask_render.sum(dim=(-2, -1)) + mask_target.sum(dim=(-2, -1))
+    dice = (2.0 * intersection + smooth) / (cardinality + smooth)
+    return (1.0 - dice).mean()
 
 
 def eval_spline_error(
     render: torch.Tensor,
     target: torch.Tensor,
-    band_frac: float = 0.8,
-    hsv_lower=(0, 110, 100),
-    hsv_upper=(30, 255, 255),
-    min_frac: float = 0.002,
-) -> torch.Tensor | None:
-    """Non-training evaluation: returns exact integrated L2 error or None if track missing."""
+    band_frac: float = 0.70,
+    hsv_lower=(0, 27, 182),
+    hsv_upper=(13, 255, 255),
+    min_frac: float = 0.0004,
+    num_segments: int = 4,
+    continuity: str = "C1",
+    centerline_algorithm: str = "scan",
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[None, None]:
+    """Non-training evaluation: returns (err_norm, err_px) or (None, None) if track missing."""
     with torch.no_grad():
         m_r = soft_orange_mask_torch(render.unsqueeze(0), hsv_lower, hsv_upper)[0]
         m_t = soft_orange_mask_torch(target.unsqueeze(0), hsv_lower, hsv_upper)[0]
         H, W = m_r.shape
         min_mass = min_frac * H * W * band_frac
         if m_t.sum() < min_mass or m_r.sum() < min_mass:
-            return None
-        pts_r, _ = extract_centerline_points_torch(m_r, band_frac)
-        pts_t, _ = extract_centerline_points_torch(m_t, band_frac)
-        ctrl_r = fit_three_cubic_bsplines_torch(pts_r)
-        ctrl_t = fit_three_cubic_bsplines_torch(pts_t)
-        return exact_integrated_l2_error(ctrl_r, ctrl_t)
+            return None, None
+
+        if spline_fit is not None and hasattr(spline_fit, "extract_centerline_points"):
+            m_r_np = (m_r.clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)
+            m_t_np = (m_t.clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)
+            pts_r_np = spline_fit.extract_centerline_points(m_r_np, band_frac=band_frac, method=centerline_algorithm)
+            pts_t_np = spline_fit.extract_centerline_points(m_t_np, band_frac=band_frac, method=centerline_algorithm)
+            if pts_r_np is None or pts_t_np is None or len(pts_r_np) < 4 or len(pts_t_np) < 4:
+                return None, None
+            pts_r = torch.from_numpy(pts_r_np).to(dtype=render.dtype, device=render.device)
+            pts_t = torch.from_numpy(pts_t_np).to(dtype=render.dtype, device=render.device)
+        else:
+            pts_r, _ = extract_centerline_points_torch(m_r, band_frac)
+            pts_t, _ = extract_centerline_points_torch(m_t, band_frac)
+
+        if "fit_n_cubic_splines_torch" in globals():
+            ctrl_r = fit_n_cubic_splines_torch(pts_r, num_segments=num_segments, continuity=continuity)
+            ctrl_t = fit_n_cubic_splines_torch(pts_t, num_segments=num_segments, continuity=continuity)
+        else:
+            ctrl_r = fit_three_cubic_bsplines_torch(pts_r)
+            ctrl_t = fit_three_cubic_bsplines_torch(pts_t)
+        return exact_integrated_l2_error(ctrl_r, ctrl_t, img_w=float(W), img_h=float(H))
 
 
 @dataclass
@@ -528,23 +661,40 @@ class Config:
     with_ut: bool = False
     with_eval3d: bool = False
 
+    # Enable Soft Dice loss on track mask
+    dice_loss: bool = True
+    # Compute and output track Dice metric during evaluation upon completion
+    eval_dice_err: bool = True
+    # Weight for Soft Dice loss
+    dice_lambda: float = 0.02
+    # Step at which Dice loss kicks in (can start at 0 or early steps)
+    dice_start_step: int = 0
+    # Smoothing term for Dice calculation
+    dice_smooth: float = 1.0
+
     # Enable Spline loss for training (fits cubic B-splines to GT and rendered track)
-    spline_loss: bool = True
+    spline_loss: bool = False
+    # Number of C1 tangent-continuous cubic spline segments to fit
+    spline_segments: int = 4
+    # Centerline extraction algorithm for spline fitting: 'scan' (fast row scanner) or 'skeleton' (geodesic graph BFS)
+    spline_centerline_algorithm: Literal["scan", "skeleton"] = "scan"
     # Compute and output spline L2 error metric during evaluation upon completion
     eval_spline_err: bool = True
     # Weight for Spline loss
-    spline_lambda: float = 0.1
+    spline_lambda: float = 0.02
     # Step at which Spline loss kicks in (geometry should be roughly converged)
     spline_start_step: int = 5_000
-    # Height fraction of the frame from the bottom used for track spline fitting
-    spline_band_frac: float = 0.8
+    # Height fraction of the frame from the bottom used for track spline fitting and dice mask
+    spline_band_frac: float = 0.70
     # OpenCV-scale HSV bounds for the orange track (H 0-180, S/V 0-255)
-    spline_hsv_lower: Tuple[int, int, int] = (0, 110, 100)
-    spline_hsv_upper: Tuple[int, int, int] = (30, 255, 255)
+    spline_hsv_lower: Tuple[int, int, int] = (0, 27, 182)
+    spline_hsv_upper: Tuple[int, int, int] = (13, 255, 255)
     # Min fraction of pixels that must be track-colored
-    spline_min_frac: float = 0.002
+    spline_min_frac: float = 0.0004
     # Softness of the HSV thresholds (H, S, V)
-    spline_tau: Tuple[float, float, float] = (2.0, 10.0, 10.0)
+    spline_tau: Tuple[float, float, float] = (1.5, 3.5, 3.5)
+    # Downsample factor for auxiliary track losses (dice / spline) during training (0.5 = 2x downsample)
+    spline_downsample_factor: float = 0.5
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -763,6 +913,19 @@ class Runner:
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
+        if cfg.sparse_grad:
+            if world_size > 1:
+                if world_rank == 0:
+                    print(
+                        f"[Trainer] Note: sparse_grad is not supported with distributed multi-GPU training "
+                        f"(world_size={world_size}). Disabling sparse_grad and using packed rasterization."
+                    )
+                cfg.sparse_grad = False
+            elif not cfg.packed:
+                if world_rank == 0:
+                    print("[Trainer] Note: sparse_grad requires packed=True. Enabling packed mode.")
+                cfg.packed = True
+
         self.splats, self.optimizers = create_splats_with_optimizers(
             self.parser,
             init_type=cfg.init_type,
@@ -1253,17 +1416,60 @@ class Runner:
 
             loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
 
-            if cfg.spline_loss and step >= cfg.spline_start_step:
-                splineloss = spline_loss(
-                    render=torch.clamp(colors, 0.0, 1.0),
-                    target=pixels,
-                    band_frac=cfg.spline_band_frac,
-                    hsv_lower=cfg.spline_hsv_lower,
-                    hsv_upper=cfg.spline_hsv_upper,
-                    min_frac=cfg.spline_min_frac,
-                    tau=cfg.spline_tau,
+            run_dice = cfg.dice_loss and step >= cfg.dice_start_step
+            run_spline = cfg.spline_loss and step >= cfg.spline_start_step
+
+            if run_dice or run_spline:
+                if cfg.spline_downsample_factor < 1.0:
+                    c_track = F.interpolate(
+                        colors.permute(0, 3, 1, 2),
+                        scale_factor=cfg.spline_downsample_factor,
+                        mode="bilinear",
+                        align_corners=False,
+                    ).permute(0, 2, 3, 1)
+                    p_track = F.interpolate(
+                        pixels.permute(0, 3, 1, 2),
+                        scale_factor=cfg.spline_downsample_factor,
+                        mode="bilinear",
+                        align_corners=False,
+                    ).permute(0, 2, 3, 1)
+                else:
+                    c_track = colors
+                    p_track = pixels
+
+                c_clamped = torch.clamp(c_track, 0.0, 1.0)
+                mask_r = soft_orange_mask_torch(
+                    c_clamped,
+                    cfg.spline_hsv_lower,
+                    cfg.spline_hsv_upper,
+                    cfg.spline_tau,
                 )
-                loss = loss + cfg.spline_lambda * splineloss
+                mask_t = soft_orange_mask_torch(
+                    p_track.detach(),
+                    cfg.spline_hsv_lower,
+                    cfg.spline_hsv_upper,
+                    cfg.spline_tau,
+                )
+
+                if run_dice:
+                    diceloss = track_dice_loss(
+                        mask_render=mask_r,
+                        mask_target=mask_t,
+                        band_frac=cfg.spline_band_frac,
+                        smooth=cfg.dice_smooth,
+                    )
+                    loss = loss + cfg.dice_lambda * diceloss
+
+                if run_spline:
+                    splineloss = spline_loss(
+                        mask_render=mask_r,
+                        mask_target=mask_t,
+                        band_frac=cfg.spline_band_frac,
+                        min_frac=cfg.spline_min_frac,
+                        num_segments=cfg.spline_segments,
+                        centerline_algorithm=cfg.spline_centerline_algorithm,
+                    )
+                    loss = loss + cfg.spline_lambda * splineloss
 
             if cfg.depth_loss:
                 # query depths from depth map
@@ -1304,6 +1510,10 @@ class Runner:
             loss.backward()
 
             desc = f"loss={loss.item():.3f}| sh degree={sh_degree_to_use}| "
+            if run_dice:
+                desc += f"dice={diceloss.item():.4f}| "
+            if run_spline:
+                desc += f"spline={splineloss.item():.4f}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
@@ -1328,8 +1538,18 @@ class Runner:
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
-                if cfg.spline_loss and step >= cfg.spline_start_step:
+                if run_dice:
+                    self.writer.add_scalar("train/diceloss", diceloss.item(), step)
+                    self.writer.add_scalar(
+                        "train/track_dice", (1.0 - diceloss).item(), step
+                    )
+                if run_spline:
                     self.writer.add_scalar("train/splineloss", splineloss.item(), step)
+                    self.writer.add_scalar(
+                        "train/splineloss_px",
+                        splineloss.item() * max(colors.shape[1], colors.shape[2]),
+                        step,
+                    )
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
                 if cfg.post_processing is not None:
@@ -1566,17 +1786,32 @@ class Runner:
                 metrics["ssim"].append(self.ssim(colors_p, pixels_p))
                 metrics["lpips"].append(self.lpips(colors_p, pixels_p))
 
+                if cfg.dice_loss or cfg.eval_dice_err:
+                    dice_val = 1.0 - track_dice_loss(
+                        render=colors,
+                        target=pixels,
+                        band_frac=cfg.spline_band_frac,
+                        hsv_lower=cfg.spline_hsv_lower,
+                        hsv_upper=cfg.spline_hsv_upper,
+                        tau=cfg.spline_tau,
+                        smooth=1.0,
+                    ).item()
+                    metrics["track_dice"].append(torch.tensor(dice_val))
+
                 if cfg.spline_loss or cfg.eval_spline_err:
-                    spline_err = eval_spline_error(
+                    spline_err_norm, spline_err_px = eval_spline_error(
                         render=colors[0],
                         target=pixels[0],
                         band_frac=cfg.spline_band_frac,
                         hsv_lower=cfg.spline_hsv_lower,
                         hsv_upper=cfg.spline_hsv_upper,
                         min_frac=cfg.spline_min_frac,
+                        num_segments=cfg.spline_segments,
+                        centerline_algorithm=cfg.spline_centerline_algorithm,
                     )
-                    if spline_err is not None:
-                        metrics["spline_l2_err"].append(spline_err.cpu())
+                    if spline_err_norm is not None:
+                        metrics["spline_l2_err"].append(spline_err_norm.cpu())
+                        metrics["spline_l2_err_px"].append(spline_err_px.cpu())
 
                 # Compute color-corrected metrics for fair comparison across methods
                 if cfg.use_color_correction_metric:
@@ -1599,8 +1834,13 @@ class Runner:
                     "num_GS": len(self.splats["means"]),
                 }
             )
+            dice_str = (
+                f", Track Dice: {stats['track_dice']:.4f}"
+                if "track_dice" in stats
+                else ""
+            )
             spline_str = (
-                f", Spline L2 Err: {stats['spline_l2_err']:.6f}"
+                f", Spline L2 Err: {stats['spline_l2_err']:.6f} ({stats['spline_l2_err_px']:.2f} px)"
                 if "spline_l2_err" in stats
                 else ""
             )
@@ -1610,14 +1850,14 @@ class Runner:
                     f"CC_PSNR: {stats['cc_psnr']:.3f}, CC_SSIM: {stats['cc_ssim']:.4f}, CC_LPIPS: {stats['cc_lpips']:.3f} "
                     f"Time: {stats['ellipse_time']:.3f}s/image "
                     f"Number of GS: {stats['num_GS']}"
-                    f"{spline_str}"
+                    f"{dice_str}{spline_str}"
                 )
             else:
                 print(
                     f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
                     f"Time: {stats['ellipse_time']:.3f}s/image "
                     f"Number of GS: {stats['num_GS']}"
-                    f"{spline_str}"
+                    f"{dice_str}{spline_str}"
                 )
             # save stats as json
             with open(f"{self.stats_dir}/{stage}_step{step:04d}.json", "w") as f:
@@ -1828,7 +2068,65 @@ class Runner:
         return renders
 
 
+def print_overridden_config(cfg: Config, base_cfg: Config):
+    """Print any options that were overridden from their default values via CLI."""
+    def _differs(v1, v2):
+        if v1 is v2:
+            return False
+        try:
+            res = (v1 != v2)
+            if isinstance(res, (bool, np.bool_)):
+                return res
+            if hasattr(res, "any"):
+                return bool(res.any())
+            return bool(res)
+        except Exception:
+            return repr(v1) != repr(v2)
+
+    overrides = []
+    for f in dataclasses.fields(Config):
+        if f.name == "strategy":
+            continue
+        val = getattr(cfg, f.name)
+        dval = getattr(base_cfg, f.name)
+        if _differs(val, dval):
+            overrides.append((f.name, dval, val))
+
+    if hasattr(cfg, "strategy") and hasattr(base_cfg, "strategy"):
+        strat = cfg.strategy
+        bstrat = base_cfg.strategy
+        if type(strat) is type(bstrat) and dataclasses.is_dataclass(strat):
+            for sf in dataclasses.fields(strat):
+                val = getattr(strat, sf.name)
+                dval = getattr(bstrat, sf.name)
+                if _differs(val, dval):
+                    overrides.append((f"strategy.{sf.name}", dval, val))
+
+    print("\n" + "=" * 78)
+    if overrides:
+        print(f"[Trainer] Overridden CLI Options ({len(overrides)} applied):")
+        for name, dval, val in overrides:
+            print(f"  • {name:<28}: {dval} -> {val}")
+    else:
+        print("[Trainer] No CLI options were overridden (running with defaults).")
+    print("=" * 78 + "\n")
+
+
 def main(local_rank: int, world_rank, world_size: int, cfg: Config):
+    if world_rank == 0:
+        base_cfg = (
+            Config(
+                init_opa=0.5,
+                init_scale=0.1,
+                opacity_reg=0.01,
+                scale_reg=0.01,
+                strategy=MCMCStrategy(verbose=True),
+            )
+            if isinstance(cfg.strategy, MCMCStrategy)
+            else Config(strategy=DefaultStrategy(verbose=True))
+        )
+        print_overridden_config(cfg, base_cfg)
+
     # Import post-processing modules based on configuration
     # These imports must be here (not in __main__) for distributed workers
     if cfg.post_processing == "bilateral_grid":
